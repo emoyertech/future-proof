@@ -1,0 +1,43 @@
+# Java
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.iml
+*.ipr
+*.iws
+.settings/
+bin/
+target/
+out/
+.classpath
+.project
+.idea/
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info
+*.env
+.venv/
+venv/
+*.log
+*.swp
+*.swo
+*.sqlite
+*.sqlite3
+*.db
+*.lock
+.pytest_cache
+
+# OS and IDE specific
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+*.orig
+*.patch
+*.py~
+*.java~
