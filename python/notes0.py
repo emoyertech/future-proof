@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, re, sys, markdown2, subprocess, datetime, shutil
 import html, secrets
+import sqlite3, hashlib
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import quote
@@ -17,7 +18,14 @@ def setup():
     data.mkdir(parents=True, exist_ok=True)
     videos.mkdir(parents=True, exist_ok=True)
     thumbs.mkdir(parents=True, exist_ok=True)
-    return {"root": base, "notes": notes, "datasets": data, "videos": videos, "thumbnails": thumbs}
+    return {
+        "root": base,
+        "notes": notes,
+        "datasets": data,
+        "videos": videos,
+        "thumbnails": thumbs,
+        "auth_db": base / "auth.db",
+    }
 
 config = setup()
 app = FastAPI(title="Note & Data Hub")
@@ -81,6 +89,185 @@ def validate_csrf(request: Request, csrf_token: str):
     if not csrf_token or not cookie or not secrets.compare_digest(csrf_token, cookie):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
+def get_db_connection():
+    conn = sqlite3.connect(config["auth_db"])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_auth_db():
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS note_locks (
+            filename TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            owner_user_id INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(owner_user_id) REFERENCES users(id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_user_id INTEGER NOT NULL,
+            recipient_user_id INTEGER NOT NULL,
+            message_text TEXT NOT NULL,
+            read_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(sender_user_id) REFERENCES users(id),
+            FOREIGN KEY(recipient_user_id) REFERENCES users(id)
+        )
+    ''')
+    msg_cols = [row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "read_at" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, digest = stored_hash.split("$", 1)
+    except ValueError:
+        return False
+    calc = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return secrets.compare_digest(calc, digest)
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
+        (token, user_id, datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+def clear_session(token: str):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+def get_current_user(request: Request):
+    token = request.cookies.get("auth_token")
+    if not token:
+        return None
+    conn = get_db_connection()
+    row = conn.execute(
+        """
+        SELECT users.id, users.username, users.role
+        FROM sessions
+        JOIN users ON users.id = sessions.user_id
+        WHERE sessions.token = ?
+        """,
+        (token,),
+    ).fetchone()
+    conn.close()
+    return row
+
+def get_user_by_session_token(token: str):
+    if not token:
+        return None
+    conn = get_db_connection()
+    row = conn.execute(
+        """
+        SELECT users.id, users.username, users.role
+        FROM sessions
+        JOIN users ON users.id = sessions.user_id
+        WHERE sessions.token = ?
+        """,
+        (token,),
+    ).fetchone()
+    conn.close()
+    return row
+
+def get_api_user(request: Request):
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = header.split(" ", 1)[1].strip()
+    user = get_user_by_session_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    return user, token
+
+def get_unread_message_count(user_id: int) -> int:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE recipient_user_id = ? AND read_at IS NULL",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+def get_note_lock(filename: str):
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM note_locks WHERE filename = ?", (filename,)).fetchone()
+    conn.close()
+    return row
+
+def set_note_lock(filename: str, password: str, owner_user_id: Optional[int]):
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO note_locks (filename, password_hash, owner_user_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(filename) DO UPDATE SET
+            password_hash=excluded.password_hash,
+            owner_user_id=excluded.owner_user_id,
+            created_at=excluded.created_at
+        """,
+        (
+            filename,
+            hash_password(password),
+            owner_user_id,
+            datetime.datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+def remove_note_lock(filename: str):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM note_locks WHERE filename = ?", (filename,))
+    conn.commit()
+    conn.close()
+
+def parse_unlocked_cookie(request: Request) -> set:
+    raw = request.cookies.get("unlocked_notes", "")
+    return {item for item in raw.split("|") if item}
+
+def user_can_bypass_lock(user, lock_row) -> bool:
+    if not user:
+        return False
+    if user["role"] == "admin":
+        return True
+    return bool(lock_row and lock_row["owner_user_id"] == user["id"])
+
+init_auth_db()
+
 def thumbnail_path(video_name: str) -> Path:
     return config["thumbnails"] / f"{Path(video_name).stem}.jpg"
 
@@ -116,7 +303,13 @@ COMMON_STYLE = """
     .btn-primary { background: #007bff; color: white; }
     .btn-success { background: #28a745; color: white; }
     .btn-danger { background: #dc3545; color: white; }
+    .btn-secondary { background: #6c757d; color: white; }
+    .home-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: start; }
+    .chat-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+    .chat-item { border: 1px solid #eee; border-radius: 6px; padding: 10px; background: #fafafa; }
+    .chat-meta { color: #666; font-size: 0.75em; margin-bottom: 4px; }
     .note-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .badge-lock { font-size: 0.72em; color: #fff; background: #6c757d; border-radius: 10px; padding: 2px 8px; margin-left: 8px; }
     .preview-box { overflow-x: auto; max-height: 150px; border: 1px solid #eee; border-radius: 4px; margin-top: 10px; }
     .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
     .video-card { border: 1px solid #eee; border-radius: 8px; background: #fff; padding: 10px; }
@@ -147,6 +340,7 @@ COMMON_STYLE = """
     .player-controls .inline-form { margin-left: auto; }
     .volume-range { width: min(220px, 100%); }
     @media (max-width: 640px) {
+        .home-grid { grid-template-columns: 1fr; }
         .video-actions { flex-direction: column; align-items: stretch; gap: 10px; }
         .video-actions .btn, .video-actions button.btn { width: 100%; min-width: 0; }
         .player-controls .inline-form { margin-left: 0; }
@@ -155,21 +349,485 @@ COMMON_STYLE = """
     table { width: 100%; border-collapse: collapse; font-size: 0.75em; }
     th, td { border: 1px solid #eee; padding: 6px; text-align: left; white-space: nowrap; }
     th { background: #f9f9f9; color: #666; }
-    input[type="text"], input[type="file"], textarea { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+    input[type="text"], input[type="password"], input[type="file"], textarea { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
     form { display: flex; gap: 10px; align-items: center; }
 </style>
 """
 
 # --- 4. ROUTES ---
+@app.get("/auth/register", response_class=HTMLResponse)
+def register_page(request: Request):
+    csrf_token = get_or_create_csrf_token(request)
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/'>← Back</a>
+    <div class='card' style='max-width:460px;margin:30px auto;'>
+        <h2>Create account</h2>
+        <form action='/auth/register' method='post' style='flex-direction:column;align-items:stretch;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+            <input type='text' name='username' placeholder='Username' required>
+            <input type='password' name='password' placeholder='Password' required>
+            <button type='submit' class='btn btn-primary'>Register</button>
+        </form>
+    </div>
+    </body></html>
+    """
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/auth/register")
+def register_route(request: Request, username: str = Form(...), password: str = Form(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    clean_user = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{3,32}", clean_user):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    conn = get_db_connection()
+    count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    role = "admin" if count == 0 else "user"
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (clean_user, hash_password(password), role, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+    user_row = conn.execute("SELECT id FROM users WHERE username = ?", (clean_user,)).fetchone()
+    conn.close()
+    token = create_session(user_row["id"])
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("auth_token", token, httponly=True, samesite="lax")
+    return response
+
+@app.get("/auth/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    csrf_token = get_or_create_csrf_token(request)
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/'>← Back</a>
+    <div class='card' style='max-width:460px;margin:30px auto;'>
+        <h2>Sign in</h2>
+        <form action='/auth/login' method='post' style='flex-direction:column;align-items:stretch;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+            <input type='text' name='username' placeholder='Username' required>
+            <input type='password' name='password' placeholder='Password' required>
+            <button type='submit' class='btn btn-primary'>Login</button>
+        </form>
+    </div>
+    </body></html>
+    """
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/auth/login")
+def login_route(request: Request, username: str = Form(...), password: str = Form(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    clean_user = username.strip().lower()
+    conn = get_db_connection()
+    user = conn.execute("SELECT id, password_hash FROM users WHERE username = ?", (clean_user,)).fetchone()
+    conn.close()
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = create_session(user["id"])
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("auth_token", token, httponly=True, samesite="lax")
+    return response
+
+@app.get("/auth/logout")
+def logout_route(request: Request):
+    token = request.cookies.get("auth_token")
+    if token:
+        clear_session(token)
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie("auth_token")
+    return response
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, status: Optional[str] = None):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    csrf_token = get_or_create_csrf_token(request)
+    conn = get_db_connection()
+    full_user = conn.execute(
+        "SELECT id, username, role, created_at FROM users WHERE id = ?",
+        (user["id"],),
+    ).fetchone()
+    conn.close()
+    status_html = ""
+    if status == "ok":
+        status_html = "<p style='color:#155724;background:#d4edda;padding:8px;border-radius:4px;'>Password updated.</p>"
+    elif status == "badpass":
+        status_html = "<p style='color:#721c24;background:#f8d7da;padding:8px;border-radius:4px;'>Current password is incorrect.</p>"
+    elif status == "short":
+        status_html = "<p style='color:#721c24;background:#f8d7da;padding:8px;border-radius:4px;'>New password must be at least 6 characters.</p>"
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/'>← Back</a>
+    <h1>Account</h1>
+    <div class='card'>
+        <p><strong>Username:</strong> {h(full_user['username'])}</p>
+        <p><strong>Role:</strong> {h(full_user['role'])}</p>
+        <p><strong>Created:</strong> {h(full_user['created_at'])}</p>
+    </div>
+    <div class='card' style='max-width:520px;'>
+        <h3>Change Password</h3>
+        {status_html}
+        <form action='/account/password' method='post' style='flex-direction:column;align-items:stretch;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+            <input type='password' name='current_password' placeholder='Current password' required>
+            <input type='password' name='new_password' placeholder='New password' required>
+            <button type='submit' class='btn btn-primary'>Update Password</button>
+        </form>
+    </div>
+    </body></html>
+    """
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/account/password")
+def account_password_route(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    csrf_token: str = Form(""),
+):
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    if len(new_password) < 6:
+        return RedirectResponse("/account?status=short", status_code=303)
+    conn = get_db_connection()
+    row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
+    if not row or not verify_password(current_password, row["password_hash"]):
+        conn.close()
+        return RedirectResponse("/account?status=badpass", status_code=303)
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_password), user["id"]))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/account?status=ok", status_code=303)
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users_page(request: Request):
+    user = get_current_user(request)
+    if not user or user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    conn = get_db_connection()
+    users = conn.execute("SELECT id, username, role, created_at FROM users ORDER BY id ASC").fetchall()
+    conn.close()
+    rows = "".join([
+        f"<tr><td>{h(urow['id'])}</td><td>{h(urow['username'])}</td><td>{h(urow['role'])}</td><td>{h(urow['created_at'])}</td></tr>"
+        for urow in users
+    ])
+    return f"<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>Admin Users</h1><div class='card'><table><thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Created</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>"
+
+@app.post("/api/auth/register")
+def api_register(username: str = Form(...), password: str = Form(...)):
+    clean_user = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{3,32}", clean_user):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    conn = get_db_connection()
+    count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    role = "admin" if count == 0 else "user"
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (clean_user, hash_password(password), role, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+    user_row = conn.execute("SELECT id, username, role FROM users WHERE username = ?", (clean_user,)).fetchone()
+    conn.close()
+    token = create_session(user_row["id"])
+    return {"token": token, "user": {"id": user_row["id"], "username": user_row["username"], "role": user_row["role"]}}
+
+@app.post("/api/auth/login")
+def api_login(username: str = Form(...), password: str = Form(...)):
+    clean_user = username.strip().lower()
+    conn = get_db_connection()
+    user = conn.execute("SELECT id, username, role, password_hash FROM users WHERE username = ?", (clean_user,)).fetchone()
+    conn.close()
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = create_session(user["id"])
+    return {"token": token, "user": {"id": user["id"], "username": user["username"], "role": user["role"]}}
+
+@app.get("/api/me")
+def api_me(request: Request):
+    user, _ = get_api_user(request)
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "unread_messages": get_unread_message_count(user["id"]),
+    }
+
+@app.get("/api/notes")
+def api_list_notes(request: Request):
+    user, _ = get_api_user(request)
+    note_files = sorted([f.name for f in config["notes"].glob("*") if f.suffix in [".md", ".txt"]])
+    items = []
+    for name in note_files:
+        lock_row = get_note_lock(name)
+        can_access_without_password = not lock_row or user_can_bypass_lock(user, lock_row)
+        items.append({"filename": name, "locked": bool(lock_row), "can_access_without_password": can_access_without_password})
+    return {"notes": items}
+
+@app.get("/api/notes/{filename}")
+def api_get_note(request: Request, filename: str, note_password: Optional[str] = None):
+    user, _ = get_api_user(request)
+    name = ensure_safe_filename(filename)
+    file_path = config["notes"] / name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Note not found")
+    lock_row = get_note_lock(name)
+    if lock_row and not user_can_bypass_lock(user, lock_row):
+        if not note_password or not verify_password(note_password, lock_row["password_hash"]):
+            raise HTTPException(status_code=403, detail="Note is locked")
+    meta, body = parse_note(file_path)
+    return {"filename": name, "meta": meta, "content": body, "locked": bool(lock_row)}
+
+@app.post("/api/notes")
+def api_create_note(request: Request, title: str = Form(...), content: str = Form(""), lock_password: str = Form("")):
+    user, _ = get_api_user(request)
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", clean_title).strip("_") or "note"
+    name = base + ".md"
+    save_note(config["notes"] / name, {"title": clean_title}, content or f"# {clean_title}")
+    if lock_password:
+        if len(lock_password) < 4:
+            raise HTTPException(status_code=400, detail="Lock password must be at least 4 characters")
+        set_note_lock(name, lock_password, user["id"])
+    return {"filename": name, "locked": bool(lock_password)}
+
+@app.get("/api/messages")
+def api_messages(request: Request, mark_read: bool = True):
+    user, _ = get_api_user(request)
+    conn = get_db_connection()
+    unread_before = conn.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE recipient_user_id = ? AND read_at IS NULL",
+        (user["id"],),
+    ).fetchone()["c"]
+    if mark_read:
+        conn.execute(
+            "UPDATE messages SET read_at = ? WHERE recipient_user_id = ? AND read_at IS NULL",
+            (datetime.datetime.utcnow().isoformat(), user["id"]),
+        )
+        conn.commit()
+    inbox = conn.execute(
+        """
+        SELECT messages.id, messages.message_text, messages.created_at, messages.read_at, users.username AS sender_username
+        FROM messages
+        JOIN users ON users.id = messages.sender_user_id
+        WHERE messages.recipient_user_id = ?
+        ORDER BY messages.id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    sent = conn.execute(
+        """
+        SELECT messages.id, messages.message_text, messages.created_at, messages.read_at, users.username AS recipient_username
+        FROM messages
+        JOIN users ON users.id = messages.recipient_user_id
+        WHERE messages.sender_user_id = ?
+        ORDER BY messages.id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    return {
+        "unread_before_mark": unread_before,
+        "inbox": [
+            {"id": m["id"], "from": m["sender_username"], "text": m["message_text"], "created_at": m["created_at"], "read_at": m["read_at"]}
+            for m in inbox
+        ],
+        "sent": [
+            {"id": m["id"], "to": m["recipient_username"], "text": m["message_text"], "created_at": m["created_at"], "read_at": m["read_at"], "read": bool(m["read_at"])}
+            for m in sent
+        ],
+    }
+
+@app.post("/api/messages")
+def api_send_message(request: Request, recipient_username: str = Form(...), message_text: str = Form(...)):
+    user, _ = get_api_user(request)
+    target_name = recipient_username.strip().lower()
+    body = message_text.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(body) > 2000:
+        raise HTTPException(status_code=400, detail="Message is too long")
+    conn = get_db_connection()
+    recipient = conn.execute(
+        "SELECT id, username FROM users WHERE lower(username) = lower(?)",
+        (target_name,),
+    ).fetchone()
+    if not recipient:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    if recipient["id"] == user["id"]:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    conn.execute(
+        "INSERT INTO messages (sender_user_id, recipient_user_id, message_text, read_at, created_at) VALUES (?, ?, ?, NULL, ?)",
+        (user["id"], recipient["id"], body, datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    message_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    conn.close()
+    return {"id": message_id, "to": recipient["username"], "text": body}
+
+@app.get("/messages", response_class=HTMLResponse)
+def messages_page(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    csrf_token = get_or_create_csrf_token(request)
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE messages SET read_at = ? WHERE recipient_user_id = ? AND read_at IS NULL",
+        (datetime.datetime.utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    recipients = conn.execute(
+        "SELECT id, username FROM users WHERE id != ? ORDER BY username ASC",
+        (user["id"],),
+    ).fetchall()
+    inbox = conn.execute(
+        """
+        SELECT messages.id, messages.message_text, messages.created_at, users.username AS sender_username
+        FROM messages
+        JOIN users ON users.id = messages.sender_user_id
+        WHERE messages.recipient_user_id = ?
+        ORDER BY messages.id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    sent = conn.execute(
+        """
+        SELECT messages.id, messages.message_text, messages.created_at, messages.read_at, users.username AS recipient_username
+        FROM messages
+        JOIN users ON users.id = messages.recipient_user_id
+        WHERE messages.sender_user_id = ?
+        ORDER BY messages.id DESC
+        """,
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+
+    recipient_options = "".join([
+        f"<option value='{h(r['username'])}'>{h(r['username'])}</option>" for r in recipients
+    ])
+    inbox_html = "".join([
+        f"<div class='note-item'><div><strong>From:</strong> {h(m['sender_username'])}<br><span>{h(m['message_text'])}</span><br><small>{h(m['created_at'])}</small></div></div>"
+        for m in inbox
+    ]) or "<p>No messages yet.</p>"
+    sent_html = "".join([
+        f"<div class='note-item'><div><strong>To:</strong> {h(m['recipient_username'])} · <strong>{'Read' if m['read_at'] else 'Unread'}</strong><br><span>{h(m['message_text'])}</span><br><small>Sent: {h(m['created_at'])}{' · Read: ' + h(m['read_at']) if m['read_at'] else ''}</small></div></div>"
+        for m in sent
+    ]) or "<p>No sent messages.</p>"
+
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/'>← Back</a>
+    <h1>Messages</h1>
+    <div class='card'>
+        <h3>Send Message</h3>
+        <form action='/messages/send' method='post' style='flex-wrap:wrap;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+            <select name='recipient_username' required style='padding:10px;border:1px solid #ddd;border-radius:4px;'>
+                <option value=''>Select recipient</option>
+                {recipient_options}
+            </select>
+            <input type='text' name='message_text' placeholder='Write a message...' style='flex-grow:1;' required>
+            <button type='submit' class='btn btn-primary'>Send</button>
+        </form>
+    </div>
+    <div class='card'><h3>Inbox</h3>{inbox_html}</div>
+    <div class='card'><h3>Sent</h3>{sent_html}</div>
+    </body></html>
+    """
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/messages/send")
+def send_message_route(
+    request: Request,
+    recipient_username: str = Form(...),
+    message_text: str = Form(...),
+    csrf_token: str = Form(""),
+):
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    target_name = recipient_username.strip().lower()
+    body = message_text.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(body) > 2000:
+        raise HTTPException(status_code=400, detail="Message is too long")
+
+    conn = get_db_connection()
+    recipient = conn.execute(
+        "SELECT id, username FROM users WHERE lower(username) = lower(?)",
+        (target_name,),
+    ).fetchone()
+    if not recipient:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    if recipient["id"] == user["id"]:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+
+    conn.execute(
+        "INSERT INTO messages (sender_user_id, recipient_user_id, message_text, read_at, created_at) VALUES (?, ?, ?, NULL, ?)",
+        (user["id"], recipient["id"], body, datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/messages", status_code=303)
+
 @app.get("/", response_class=HTMLResponse)
 def web_home(request: Request, q: Optional[str] = None):
     csrf_token = get_or_create_csrf_token(request)
+    user = get_current_user(request)
+    auth_html = ""
+    if user:
+        unread_count = get_unread_message_count(user["id"])
+        admin_link = ""
+        if user["role"] == "admin":
+            admin_link = "<a href='/admin/users' class='btn btn-secondary'>Admin</a>"
+        msg_label = f"Messages ({unread_count})" if unread_count else "Messages"
+        auth_html = f"<div class='card' style='display:flex;justify-content:space-between;align-items:center;'><div>Signed in as <strong>{h(user['username'])}</strong> ({h(user['role'])})</div><div style='display:flex;gap:8px;'><a href='/messages' class='btn btn-secondary'>{h(msg_label)}</a><a href='/account' class='btn btn-secondary'>Account</a>{admin_link}<a href='/auth/logout' class='btn btn-secondary'>Logout</a></div></div>"
+    else:
+        auth_html = "<div class='card' style='display:flex;justify-content:space-between;align-items:center;'><div>Browsing as guest</div><div style='display:flex;gap:8px;'><a href='/auth/login' class='btn btn-secondary'>Login</a><a href='/auth/register' class='btn btn-primary'>Register</a></div></div>"
+
     # Action Forms
     actions_html = f"""
     <div class='card'>
-        <form action='/notes/create' method='post' style='margin-bottom:15px;'>
+        <form action='/notes/create' method='post' style='margin-bottom:15px;flex-wrap:wrap;'>
             <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
             <input type='text' name='filename' placeholder='New note title...' style='flex-grow:1' required>
+            <label style='display:flex;align-items:center;gap:6px;font-size:0.9em;'>
+                <input type='checkbox' name='lock_note' value='1'>
+                Locked note
+            </label>
+            <input type='password' name='lock_password' placeholder='Lock password (optional unless locked)'>
             <button type='submit' class='btn btn-primary'>+ Create Note</button>
         </form>
         <form action='/datasets/import' method='post' enctype='multipart/form-data'>
@@ -199,7 +857,66 @@ def web_home(request: Request, q: Optional[str] = None):
         datasets_raw = [d for d in datasets_raw if q in d.lower()]
         videos_raw = [v for v in videos_raw if q in v.lower()]
 
-    notes_html = "".join([f"<div class='note-item'><span>{h(n)}</span><a href='/notes/{u(n)}' class='btn btn-primary'>View</a></div>" for n in notes_raw])
+    chat_html = ""
+    if user:
+        unread_count = get_unread_message_count(user["id"])
+        conn = get_db_connection()
+        recipients = conn.execute(
+            "SELECT username FROM users WHERE id != ? ORDER BY username ASC",
+            (user["id"],),
+        ).fetchall()
+        recent_inbox = conn.execute(
+            """
+            SELECT messages.message_text, messages.created_at, users.username AS sender_username
+            FROM messages
+            JOIN users ON users.id = messages.sender_user_id
+            WHERE messages.recipient_user_id = ?
+            ORDER BY messages.id DESC
+            LIMIT 5
+            """,
+            (user["id"],),
+        ).fetchall()
+        conn.close()
+
+        recipient_options = "".join([
+            f"<option value='{h(r['username'])}'>{h(r['username'])}</option>" for r in recipients
+        ])
+        recent_html = "".join([
+            f"<div class='chat-item'><div class='chat-meta'>From {h(msg['sender_username'])} · {h(msg['created_at'])}</div><div>{h(msg['message_text'])}</div></div>"
+            for msg in recent_inbox
+        ]) or "<p>No recent messages.</p>"
+
+        chat_html = f"""
+        <div class='card'>
+            <h2>💬 Chat {f'({unread_count} unread)' if unread_count else ''}</h2>
+            <form action='/messages/send' method='post' style='flex-wrap:wrap;'>
+                <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+                <select name='recipient_username' required style='padding:10px;border:1px solid #ddd;border-radius:4px;'>
+                    <option value=''>Recipient</option>
+                    {recipient_options}
+                </select>
+                <input type='text' name='message_text' placeholder='Type a message...' style='flex-grow:1' required>
+                <button type='submit' class='btn btn-primary'>Send</button>
+            </form>
+            <div class='chat-list'>{recent_html}</div>
+            <div style='margin-top:10px;'><a href='/messages' class='btn btn-secondary'>Open Full Chat</a></div>
+        </div>
+        """
+    else:
+        chat_html = """
+        <div class='card'>
+            <h2>💬 Chat</h2>
+            <p>Sign in to message other users.</p>
+            <a href='/auth/login' class='btn btn-secondary'>Sign In</a>
+        </div>
+        """
+
+    notes_html_parts = []
+    for n in notes_raw:
+        lock_row = get_note_lock(n)
+        lock_badge = "<span class='badge-lock'>Locked</span>" if lock_row else ""
+        notes_html_parts.append(f"<div class='note-item'><span>{h(n)} {lock_badge}</span><a href='/notes/{u(n)}' class='btn btn-primary'>View</a></div>")
+    notes_html = "".join(notes_html_parts)
     
     datasets_html = ""
     for d_name in datasets_raw:
@@ -233,7 +950,7 @@ def web_home(request: Request, q: Optional[str] = None):
             </div>
         </div>"""
 
-    page = f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{actions_html}<div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}<div class='card'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
+    page = f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{actions_html}<div class='home-grid'><div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}</div><div class='card'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
     response = HTMLResponse(content=page)
     response.set_cookie("csrf_token", csrf_token, samesite="lax")
     return response
@@ -242,9 +959,34 @@ def web_home(request: Request, q: Optional[str] = None):
 def view_note(request: Request, filename: str, edit: bool = False):
     name = ensure_safe_filename(filename)
     csrf_token = get_or_create_csrf_token(request)
+    user = get_current_user(request)
     filepath = config["notes"] / name
     if not filepath.exists(): raise HTTPException(404)
     meta, body = parse_note(filepath)
+    lock_row = get_note_lock(name)
+    unlocked_set = parse_unlocked_cookie(request)
+    can_bypass = user_can_bypass_lock(user, lock_row)
+    is_unlocked = name in unlocked_set
+    if lock_row and not can_bypass and not is_unlocked:
+        page = f"""
+        <html><head>{COMMON_STYLE}</head><body>
+        <a href='/'>← Back</a>
+        <h1>{h(name)}</h1>
+        <div class='card'>
+            <h3>🔒 Locked note</h3>
+            <p>Enter the note password to open this file.</p>
+            <form action='/notes/{u(name)}/unlock' method='post' style='flex-wrap:wrap;'>
+                <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+                <input type='password' name='note_password' placeholder='Note password' required>
+                <button type='submit' class='btn btn-primary'>Unlock</button>
+            </form>
+        </div>
+        </body></html>
+        """
+        response = HTMLResponse(page)
+        response.set_cookie("csrf_token", csrf_token, samesite="lax")
+        return response
+
     name_u = u(name)
     if edit:
         content = f"<form action='/notes/{name_u}/save' method='post'><input type='hidden' name='csrf_token' value='{h(csrf_token)}'><textarea name='content' style='width:100%;height:450px;'>{h(body)}</textarea><br><br><button type='submit' class='btn btn-primary'>Save</button></form>"
@@ -254,6 +996,21 @@ def view_note(request: Request, filename: str, edit: bool = False):
     page = f"<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>{h(name)}</h1>{content}</body></html>"
     response = HTMLResponse(content=page)
     response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/notes/{filename}/unlock")
+def unlock_note_route(request: Request, filename: str, note_password: str = Form(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    name = ensure_safe_filename(filename)
+    lock_row = get_note_lock(name)
+    if not lock_row:
+        return RedirectResponse(f"/notes/{u(name)}", status_code=303)
+    if not verify_password(note_password, lock_row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid note password")
+    unlocked = parse_unlocked_cookie(request)
+    unlocked.add(name)
+    response = RedirectResponse(f"/notes/{u(name)}", status_code=303)
+    response.set_cookie("unlocked_notes", "|".join(sorted(unlocked)), samesite="lax")
     return response
 
 @app.get("/datasets/{filename}/full", response_class=HTMLResponse)
@@ -269,6 +1026,10 @@ def view_full_dataset(filename: str):
 def save_note_route(request: Request, filename: str, content: str = Form(...), csrf_token: str = Form("")):
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
+    user = get_current_user(request)
+    lock_row = get_note_lock(name)
+    if lock_row and not user_can_bypass_lock(user, lock_row) and name not in parse_unlocked_cookie(request):
+        raise HTTPException(status_code=403, detail="Note is locked")
     filepath = config["notes"] / name
     meta, _ = parse_note(filepath)
     save_note(filepath, meta, content)
@@ -278,16 +1039,34 @@ def save_note_route(request: Request, filename: str, content: str = Form(...), c
 def delete_note_route(request: Request, filename: str, csrf_token: str = Form("")):
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
+    user = get_current_user(request)
+    lock_row = get_note_lock(name)
+    if lock_row and not user_can_bypass_lock(user, lock_row) and name not in parse_unlocked_cookie(request):
+        raise HTTPException(status_code=403, detail="Note is locked")
     (config["notes"] / name).unlink(missing_ok=True)
+    remove_note_lock(name)
     return RedirectResponse("/", status_code=303)
 
 @app.post("/notes/create")
-def create_note_route(request: Request, filename: str = Form(...), csrf_token: str = Form("")):
+def create_note_route(
+    request: Request,
+    filename: str = Form(...),
+    lock_note: Optional[str] = Form(None),
+    lock_password: str = Form(""),
+    csrf_token: str = Form(""),
+):
     validate_csrf(request, csrf_token)
+    user = get_current_user(request)
     title = filename.strip()
     base = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_") or "note"
     name = base + ".md"
     save_note(config["notes"] / name, {"title": title}, f"# {title}")
+    if lock_note:
+        if not user:
+            raise HTTPException(status_code=403, detail="Login required to create locked notes")
+        if len(lock_password) < 4:
+            raise HTTPException(status_code=400, detail="Lock password must be at least 4 characters")
+        set_note_lock(name, lock_password, user["id"])
     return RedirectResponse("/", status_code=303)
 
 @app.post("/datasets/import")
