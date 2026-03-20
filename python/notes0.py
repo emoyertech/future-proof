@@ -1,305 +1,141 @@
 #!/usr/bin/env python3
-import os
-import re
-import sys
-import markdown2
-import subprocess
-import datetime
+import os, re, sys, markdown2, subprocess, datetime, shutil
 from pathlib import Path
 from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+import pandas as pd
 
-from fastapi import Form
-
-# --- 1. INITIALIZATION & DEPENDENCIES ---
-
-try:
-    import pandas as pd
-    from fastapi import FastAPI, HTTPException
-except ImportError:
-    print("Error: Missing dependencies. Please run: pip install fastapi pandas uvicorn")
-    sys.exit(1)
-
+# --- 1. SETUP ---
 def setup():
-    """Initialize the notes application directory structure in ~/.notes."""
-    base_dir = Path.home() / ".notes"
-    notes_dir = base_dir / "notes"
-    datasets_dir = base_dir / "datasets"
-
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    datasets_dir.mkdir(parents=True, exist_ok=True)
-
-    return {
-        "root": base_dir,
-        "notes": notes_dir,
-        "datasets": datasets_dir
-    }
+    base = Path.home() / ".notes"
+    notes, data = base / "notes", base / "datasets"
+    notes.mkdir(parents=True, exist_ok=True)
+    data.mkdir(parents=True, exist_ok=True)
+    return {"root": base, "notes": notes, "datasets": data}
 
 config = setup()
-app = FastAPI(title="Future Proof Notes & Data API")
+app = FastAPI(title="Note & Data Hub")
 
 # --- 2. CORE LOGIC ---
-
-def parse_note(file_path: Path):
-    """Parses Markdown frontmatter and body."""
-    if not file_path.exists():
-        return {'title': file_path.stem, 'tags': []}, ""
-    
-    content = file_path.read_text(encoding='utf-8')
-    match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', content, re.DOTALL)
-    
-    if not match:
-        return {'title': file_path.stem, 'tags': []}, content
-
-    header_raw, body = match.groups()
-    metadata = {}
-    for line in header_raw.strip().splitlines():
-        if ':' in line:
-            key, val = [item.strip() for item in line.split(':', 1)]
-            if key.lower() == 'tags':
-                val = val.strip('[]').split(',')
-                val = [t.strip() for t in val if t.strip()]
-            metadata[key.lower()] = val
-    return metadata, body.strip()
-
-def save_note(file_path: Path, meta: dict, body: str):
-    """Writes metadata and body back to the file in markdown format."""
-    meta_copy = meta.copy()
-    if 'tags' in meta_copy and isinstance(meta_copy['tags'], list):
-        meta_copy['tags'] = f"[{', '.join(meta_copy['tags'])}]"
-        
-    header_lines = [f"{k}: {v}" for k, v in meta_copy.items()]
-    header_text = "\n".join(header_lines)
-    new_content = f"---\n{header_text}\n---\n\n{body}"
-    file_path.write_text(new_content, encoding='utf-8')
-
-def get_dataset_metadata(filename: str):
-    """Uses pandas to extract schema and stats from CSV/JSON datasets."""
-    filepath = config["datasets"] / filename
-    if not filepath.exists():
-        return None
-    
-    stats = filepath.stat()
-    ext = filepath.suffix.lower().replace('.', '')
-    
+def parse_note(f: Path):
+    if not f.exists(): return {"title": f.stem, "tags": []}, ""
     try:
-        df = pd.read_csv(filepath) if ext == 'csv' else pd.read_json(filepath)
-        row_count = len(df)
-        schema = [{"name": col, "type": str(dtype)} for col, dtype in df.dtypes.items()]
+        content = f.read_text(encoding='utf-8')
+        match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', content, re.DOTALL)
+        if not match: return {"title": f.stem, "tags": []}, content
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ':' in line:
+                k, v = [item.strip() for item in line.split(':', 1)]
+                meta[k.lower()] = [t.strip() for t in v.strip('[]').split(',')] if k.lower() == 'tags' else v
+        return meta, match.group(2).strip()
     except Exception:
-        row_count, schema = 0, []
+        return {"title": f.stem, "tags": []}, ""
 
-    return {
-        "id": filepath.stem,
-        "title": filepath.stem.replace('_', ' ').title(),
-        "created": datetime.datetime.fromtimestamp(stats.st_ctime).isoformat(),
-        "modified": datetime.datetime.fromtimestamp(stats.st_mtime).isoformat(),
-        "tags": ["dataset", ext],
-        "format": ext,
-        "rowCount": row_count,
-        "schema": schema
-    }
+def save_note(f: Path, meta: dict, body: str):
+    if isinstance(meta.get('tags'), list): 
+        meta['tags'] = f"[{', '.join(meta['tags'])}]"
+    head = "\n".join([f"{k}: {v}" for k, v in meta.items()])
+    f.write_text(f"---\n{head}\n---\n\n{body}", encoding='utf-8')
 
-# --- 3. API ROUTES (WEB INTERFACE) ---
+def get_dataset_info(name: str):
+    f = config["datasets"] / name
+    if not f.exists(): return None
+    ext = f.suffix.lower()[1:]
+    try:
+        # Robust loading to prevent internal errors on empty files
+        df = pd.read_csv(f) if ext == 'csv' else pd.read_json(f)
+        if df.empty: return {"id": name, "rows": 0, "preview": []}
+        return {
+            "id": name, "format": ext, "rows": len(df),
+            "preview": df.head(3).to_dict(orient="records")
+        }
+    except Exception:
+        return {"id": name, "rows": 0, "preview": []}
 
+# --- 3. HELPERS FOR WEB ---
+def get_all_notes():
+    return [{"id": f.name, "meta": parse_note(f)[0]} for f in config["notes"].glob("*.md")]
+
+def get_all_datasets():
+    return [get_dataset_info(f.name) for f in config["datasets"].glob("*") if f.suffix in ['.csv', '.json']]
+
+# --- 4. WEB INTERFACE ---
 COMMON_STYLE = """
 <style>
-    body { font-family: sans-serif; line-height: 1.6; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f4f4f9; }
-    h1 { color: #333; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
-    .section { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-    ul { list-style: none; padding: 0; }
-    li { margin: 10px 0; border-bottom: 1px solid #eee; padding-bottom: 5px; }
-    a { color: #007bff; text-decoration: none; font-weight: bold; }
-    a:hover { text-decoration: underline; }
-    .btn { display: inline-block; padding: 8px 15px; border-radius: 4px; color: white; text-decoration: none; border: none; cursor: pointer; }
-    .btn-save { background: #28a745; }
-    .btn-edit { background: #007bff; }
+    body { font-family: -apple-system, sans-serif; max-width: 850px; margin: auto; background: #f8f9fa; padding: 30px; color: #212529; }
+    .card { background: #fff; padding: 20px; margin-bottom: 25px; border-radius: 10px; border: 1px solid #e9ecef; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+    .note-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #f1f3f5; }
+    .note-item:last-child { border-bottom: none; }
+    .btn { text-decoration: none; padding: 8px 16px; border-radius: 6px; font-weight: 500; font-size: 0.9em; border: none; cursor: pointer; display: inline-block; }
+    .btn-primary { background: #007bff; color: white; }
+    .btn-success { background: #28a745; color: white; }
+    .preview-box { overflow-x: auto; max-height: 160px; border: 1px solid #dee2e6; border-radius: 6px; margin-top: 12px; background: #fff; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8em; }
+    th, td { border: 1px solid #dee2e6; padding: 8px; text-align: left; white-space: nowrap; }
+    th { background: #f1f3f5; color: #495057; font-weight: 600; }
+    input[type="text"], input[type="file"] { padding: 10px; border: 1px solid #ced4da; border-radius: 6px; flex-grow: 1; }
+    form { display: flex; gap: 12px; align-items: center; }
+    h2 { font-size: 1.4em; margin-bottom: 15px; color: #343a40; }
 </style>
 """
 
 @app.get("/", response_class=HTMLResponse)
-def api_home():
-    notes = [f.name for f in config["notes"].glob("*") if f.suffix in ['.md', '.txt']]
-    datasets = [f.name for f in config["datasets"].glob("*.csv")]
+def web_home():
+    actions_html = f"""
+    <div class='card'>
+        <h2 style='margin-top:0'>New Note</h2>
+        <form action='/notes/create' method='post'>
+            <input type='text' name='filename' placeholder='Note title...' required>
+            <button type='submit' class='btn btn-primary'>Create</button>
+        </form>
+        <hr style='margin: 25px 0; border: 0; border-top: 1px solid #e9ecef;'>
+        <h2>Upload Data</h2>
+        <form action='/datasets/import' method='post' enctype='multipart/form-data'>
+            <input type='file' name='file' accept='.csv,.json' required>
+            <button type='submit' class='btn btn-success'>Upload</button>
+        </form>
+    </div>"""
 
-    notes_html = "".join([f'<li><a href="/notes/{n}">{n}</a></li>' for n in sorted(notes)])
-    data_html = "".join([f'<li><a href="/api/datasets/{d}/metadata">{d}</a></li>' for d in sorted(datasets)])
-
-    return f"""
-    <html><head>{COMMON_STYLE}</head><body>
-        <h1>🚀 Future Proof Notes</h1>
-        
-        <!-- NEW: Quick Create Section -->
-        <div class="section" style="background: #eef2f7; border: 1px dashed #0366d6;">
-            <form action="/notes/create" method="post" style="display: flex; gap: 10px; align-items: center;">
-                <input type="text" name="filename" placeholder="New note name (e.g., ideas.md)" 
-                       style="flex-grow: 1; padding: 10px; border-radius: 4px; border: 1px solid #ddd;" required>
-                <button type="submit" class="btn btn-edit">+ New Note</button>
-            </form>
-        </div>
-
-        <div class="section">
-            <h2>📝 My Notes</h2>
-            <ul>{notes_html or "<li>No notes found</li>"}</ul>
-        </div>
-        ...
-    </body></html>
-    """
-
-
-@app.get("/notes/{filename}", response_class=HTMLResponse)
-def view_note_api(filename: str, edit: bool = False):
-    filepath = config["notes"] / filename
-    if not filepath.exists(): raise HTTPException(status_code=404)
-    meta, body = parse_note(filepath)
+    notes_html = "".join([f"<div class='note-item'><span>{n['meta'].get('title', n['id'])}</span> <a href='/notes/{n['id']}' class='btn btn-primary'>View</a></div>" for n in get_all_notes()])
     
-    if edit:
-        content_area = f"""
-            <form action="/notes/{filename}/save" method="post">
-                <textarea name="content" style="width:100%; height:450px; font-family:monospace; padding:10px;">{body}</textarea>
-                <br><br>
-                <div style="display: flex; gap: 10px;">
-                    <button type="submit" class="btn btn-save">Save Changes</button>
-                    
-                    <!-- NEW: Delete Button -->
-                    <button type="button" class="btn btn-delete" 
-                        onclick="if(confirm('Delete this note forever?')) window.location.href='/notes/{filename}/delete'">
-                        Delete Note
-                    </button>
-                    
-                    <a href="/notes/{filename}" style="align-self: center; margin-left: 10px;">Cancel</a>
-                </div>
-            </form>"""
+    datasets_html = ""
+    for d in get_all_datasets():
+        if d is None: continue
+        headers = "".join([f"<th>{k}</th>" for k in d['preview'][0].keys()]) if d['preview'] else ""
+        rows = "".join([f"<tr>{''.join([f'<td>{v}</td>' for v in r.values()])}</tr>" for r in d['preview']])
+        datasets_html += f"""
+        <div class='card'>
+            <strong>📊 {d['id']}</strong> <small style='color:#6c757d'>({d['rows']} rows)</small>
+            <div class='preview-box'><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div>
+        </div>"""
 
-    else:
-        # NEW: Convert Markdown to HTML for viewing
-        # 'extras' enables things like tables and task lists
-        html_content = markdown2.markdown(body, extras=["fenced-code-blocks", "tables", "task_list"])
-        content_area = f"""
-            <div class="markdown-body" style="background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
-                {html_content}
-            </div>
-            <br>
-            <a href="/notes/{filename}?edit=true" class="btn btn-edit">Edit Note</a>"""
-
-    return f"""
-    <html><head>{COMMON_STYLE}</head><body>
-        <a href="/">← Back to List</a>
-        <h1>{meta.get('title', filename)}</h1>
-        <p><strong>Tags:</strong> {", ".join(meta.get('tags', []))}</p>
-        {content_area}
-    </body></html>
-    """
-
-@app.post("/notes/{filename}/save")
-def save_note_api(filename: str, content: str = Form(...)):
-    filepath = config["notes"] / filename
-    meta, _ = parse_note(filepath)
-    save_note(filepath, meta, content)
-    return HTMLResponse(content=f'<script>window.location.href="/notes/{filename}";</script>')
-
-@app.get("/api/datasets/{filename}/metadata")
-def get_metadata_endpoint(filename: str):
-    metadata = get_dataset_metadata(filename)
-    if not metadata: raise HTTPException(status_code=404)
-    return metadata
-
-@app.get("/notes/{filename}/delete")
-def delete_note_api(filename: str):
-    filepath = config["notes"] / filename
-    
-    if filepath.exists():
-        filepath.unlink()  # Permanently deletes the file
-        # This sends the user back to the home page (the "/" route)
-        return RedirectResponse(url="/", status_code=303)
-    
-    raise HTTPException(status_code=404, detail="Note not found")
+    return f"""<html><head>{COMMON_STYLE}</head><body>
+        <h1>🚀 Note & Data Hub</h1>
+        {actions_html}
+        <div class='card'><h2>📝 My Notes</h2>{notes_html or '<p style="color:#6c757d">No notes found.</p>'}</div>
+        <h2 style='padding-left:10px'>📊 My Datasets</h2>{datasets_html or '<div class="card"><p style="color:#6c757d">No datasets found.</p></div>'}
+    </body></html>"""
 
 @app.post("/notes/create")
-def create_note_api(filename: str = Form(...)):
-    # 1. Clean up the name (ensure it ends in .md)
-    if not filename.endswith(".md"):
-        filename += ".md"
-    
-    filepath = config["notes"] / filename
-    
-    # 2. Create the file if it's new
-    if not filepath.exists():
-        title = filename.replace(".md", "").replace("_", " ").title()
-        content = f"---\ntitle: {title}\ntags: []\n---\n\n# {title}\n"
-        filepath.write_text(content)
-    
-    # 3. Send the user straight to the edit page for this new note
-    return RedirectResponse(url=f"/notes/{filename}?edit=true", status_code=303)
+def web_create_note(filename: str = Form(...)):
+    clean_name = re.sub(r'[^a-zA-Z0-9]', '_', filename).lower() + ".md"
+    path = config["notes"] / clean_name
+    save_note(path, {"title": filename, "tags": []}, f"# {filename}")
+    return RedirectResponse("/", status_code=303)
 
-
-
-# --- 4. CLI COMMANDS ---
-
-def list_notes():
-    notes_path = config["notes"]
-    note_files = list(notes_path.glob("*.md")) + list(notes_path.glob("*.txt"))
-    print(f"\n{'Filename':<30} | {'Title'}\n" + "-" * 50)
-    for f in sorted(note_files):
-        meta, _ = parse_note(f) 
-        print(f"{f.name:<30} | {meta.get('title', f.stem)}")
-
-def edit_note(args: List[str]):
-    name = " ".join(args) or input("Enter note name: ").strip()
-    if not any(name.endswith(ext) for ext in ['.md', '.txt']): name += ".md"
-    filepath = config["notes"] / name
-
-    if not filepath.exists():
-        title = name.rsplit('.', 1)[0].replace('_', ' ')
-        content = f"---\ntitle: {title}\ndate: {datetime.datetime.now().isoformat()}\ntags: []\n---\n\n# {title}\n"
-        filepath.write_text(content)
-
-    editor = os.environ.get('EDITOR', 'nano' if os.name != 'nt' else 'notepad')
-    subprocess.run([editor, str(filepath)], check=True)
-    meta, body = parse_note(filepath)
-    save_note(filepath, meta, body)
-    print(f"Synced: {name}")
-
-def search_notes(args: List[str]):
-    query = " ".join(args).lower() or input("Search term: ").strip().lower()
-    found = 0
-    for f in list(config["notes"].glob("*.md")) + list(config["notes"].glob("*.txt")):
-        meta, body = parse_note(f)
-        if query in meta.get('title', '').lower() or query in body.lower():
-            found += 1
-            print(f"[{found}] {f.name:<25}")
-    if not found: print("No matches.")
-
-def delete_note(args: List[str]):
-    name = " ".join(args)
-    path = config["notes"] / (name if name.endswith('.md') else name + ".md")
-    if path.exists() and input(f"Delete {name}? (y/n): ").lower() == 'y':
-        path.unlink()
-        print("Deleted.")
-
-def start_api():
-    file_stem = Path(__file__).stem
-    print(f"Server starting on http://127.0.0.1:8080")
-    subprocess.run(["uvicorn", f"{file_stem}:app", "--reload", "--port", "8080"])
-
-# --- 5. MAIN INTERFACE ---
-
-def main_menu():
-    actions = {'l': list_notes, 's': lambda: search_notes([]), 'e': lambda: edit_note([]), 
-               'd': lambda: delete_note([]), 'a': start_api, 'v': lambda: print("Use API for viewing.")}
-    while True:
-        print("\n[L]ist [S]earch [E]dit [D]elete [A]PI [Q]uit")
-        choice = input("Choice: ").strip().lower()
-        if choice == 'q': break
-        if choice in actions: actions[choice]()
+@app.post("/datasets/import")
+async def web_import_dataset(file: UploadFile = File(...)):
+    if not (file.filename.endswith('.csv') or file.filename.endswith('.json')):
+        raise HTTPException(400, "Only CSV/JSON allowed.")
+    path = config["datasets"] / file.filename
+    with path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return RedirectResponse("/", status_code=303)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        main_menu()
-    else:
-        cmd = sys.argv[1].lower()
-        if cmd == "api": start_api()
-        elif cmd == "list": list_notes()
-        elif cmd == "search": search_notes(sys.argv[2:])
-        elif cmd == "edit": edit_note(sys.argv[2:])
-        else: print("Unknown command.")
+    file_name = Path(__file__).stem
+    print(f"Starting server on http://127.0.0.1:8080")
+    subprocess.run(["uvicorn", f"{file_name}:app", "--reload", "--port", "8080"])
