@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os, re, sys, markdown2, subprocess, datetime, shutil
+import html, secrets
 from pathlib import Path
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Form, File, UploadFile
+from urllib.parse import quote
+from fastapi import FastAPI, HTTPException, Form, File, UploadFile, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
 import pandas as pd
 
@@ -53,8 +55,31 @@ def get_dataset_info(name: str, rows_limit: int = 3):
         }
     except: return {"id": name, "rows": 0, "preview": []}
 
+def h(value) -> str:
+    return html.escape(str(value), quote=True)
+
+def u(value: str) -> str:
+    return quote(value, safe="")
+
 def safe_name(name: str) -> str:
-    return Path(name).name
+    return Path(name or "").name
+
+def ensure_safe_filename(name: str) -> str:
+    cleaned = safe_name(name)
+    if not cleaned or cleaned != name or cleaned in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return cleaned
+
+def get_or_create_csrf_token(request: Request) -> str:
+    existing = request.cookies.get("csrf_token")
+    if existing and len(existing) >= 16:
+        return existing
+    return secrets.token_urlsafe(24)
+
+def validate_csrf(request: Request, csrf_token: str):
+    cookie = request.cookies.get("csrf_token")
+    if not csrf_token or not cookie or not secrets.compare_digest(csrf_token, cookie):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 def thumbnail_path(video_name: str) -> Path:
     return config["thumbnails"] / f"{Path(video_name).stem}.jpg"
@@ -137,25 +162,29 @@ COMMON_STYLE = """
 
 # --- 4. ROUTES ---
 @app.get("/", response_class=HTMLResponse)
-def web_home(q: Optional[str] = None):
+def web_home(request: Request, q: Optional[str] = None):
+    csrf_token = get_or_create_csrf_token(request)
     # Action Forms
     actions_html = f"""
     <div class='card'>
         <form action='/notes/create' method='post' style='margin-bottom:15px;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
             <input type='text' name='filename' placeholder='New note title...' style='flex-grow:1' required>
             <button type='submit' class='btn btn-primary'>+ Create Note</button>
         </form>
         <form action='/datasets/import' method='post' enctype='multipart/form-data'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
             <input type='file' name='file' accept='.csv,.json' style='flex-grow:1' required>
             <button type='submit' class='btn btn-success'>📥 Upload Data</button>
         </form>
         <form action='/videos/import' method='post' enctype='multipart/form-data' style='margin-top:10px;'>
+            <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
             <input type='file' name='file' accept='video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv' style='flex-grow:1' required>
             <button type='submit' class='btn btn-success'>🎬 Upload Video</button>
         </form>
     </div>
     <form action='/' method='get' style='margin-bottom:20px;'>
-        <input type='text' name='q' placeholder='Search notes, tags, or content...' style='flex-grow:1' value='{q or ""}'>
+        <input type='text' name='q' placeholder='Search notes, tags, or content...' style='flex-grow:1' value='{h(q or "")}'>
         <button type='submit' class='btn btn-primary'>Search</button>
     </form>"""
 
@@ -170,85 +199,111 @@ def web_home(q: Optional[str] = None):
         datasets_raw = [d for d in datasets_raw if q in d.lower()]
         videos_raw = [v for v in videos_raw if q in v.lower()]
 
-    notes_html = "".join([f"<div class='note-item'><span>{n}</span><a href='/notes/{n}' class='btn btn-primary'>View</a></div>" for n in notes_raw])
+    notes_html = "".join([f"<div class='note-item'><span>{h(n)}</span><a href='/notes/{u(n)}' class='btn btn-primary'>View</a></div>" for n in notes_raw])
     
     datasets_html = ""
     for d_name in datasets_raw:
         info = get_dataset_info(d_name)
         if not info: continue
-        headers = "".join([f"<th>{k}</th>" for k in info['cols']])
-        rows = "".join([f"<tr>{''.join([f'<td>{v}</td>' for v in r.values()])}</tr>" for r in info['preview']])
+        headers = "".join([f"<th>{h(k)}</th>" for k in info['cols']])
+        rows = "".join([f"<tr>{''.join([f'<td>{h(v)}</td>' for v in r.values()])}</tr>" for r in info['preview']])
+        d_name_u = u(d_name)
         datasets_html += f"""
         <div class='card'>
             <div style='display:flex;justify-content:space-between;align-items:center;'>
-                <strong>📊 {d_name}</strong>
-                <a href='/datasets/{d_name}/full' class='btn btn-primary' style='font-size:0.7em;'>Full View ↗</a>
+                <strong>📊 {h(d_name)}</strong>
+                <a href='/datasets/{d_name_u}/full' class='btn btn-primary' style='font-size:0.7em;'>Full View ↗</a>
             </div>
             <div class='preview-box'><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div>
         </div>"""
 
     videos_html = ""
     for v_name in videos_raw:
+        v_name_u = u(v_name)
         videos_html += f"""
         <div class='video-card'>
-            <a href='/videos/{v_name}'><img class='video-thumb' src='/videos/{v_name}/thumbnail' alt='thumbnail for {v_name}'></a>
-            <div class='video-title'>{v_name}</div>
+            <a href='/videos/{v_name_u}'><img class='video-thumb' src='/videos/{v_name_u}/thumbnail' alt='thumbnail for {h(v_name)}'></a>
+            <div class='video-title'>{h(v_name)}</div>
             <div class='video-actions'>
-                <a href='/videos/{v_name}' class='btn btn-primary'>Watch ▶</a>
-                <form action='/videos/{v_name}/delete' method='post' onsubmit='return confirm("Delete video?")'>
+                <a href='/videos/{v_name_u}' class='btn btn-primary'>Watch ▶</a>
+                <form action='/videos/{v_name_u}/delete' method='post' onsubmit='return confirm("Delete video?")'>
+                    <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
                     <button type='submit' class='btn btn-danger'>Delete</button>
                 </form>
             </div>
         </div>"""
 
-    return f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{actions_html}<div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}<div class='card'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
+    page = f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{actions_html}<div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}<div class='card'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
+    response = HTMLResponse(content=page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
 
 @app.get("/notes/{filename}", response_class=HTMLResponse)
-def view_note(filename: str, edit: bool = False):
-    filepath = config["notes"] / filename
+def view_note(request: Request, filename: str, edit: bool = False):
+    name = ensure_safe_filename(filename)
+    csrf_token = get_or_create_csrf_token(request)
+    filepath = config["notes"] / name
     if not filepath.exists(): raise HTTPException(404)
     meta, body = parse_note(filepath)
+    name_u = u(name)
     if edit:
-        content = f"<form action='/notes/{filename}/save' method='post'><textarea name='content' style='width:100%;height:450px;'>{body}</textarea><br><br><button type='submit' class='btn btn-primary'>Save</button></form>"
+        content = f"<form action='/notes/{name_u}/save' method='post'><input type='hidden' name='csrf_token' value='{h(csrf_token)}'><textarea name='content' style='width:100%;height:450px;'>{h(body)}</textarea><br><br><button type='submit' class='btn btn-primary'>Save</button></form>"
     else:
-        content = f"<div class='card'>{markdown2.markdown(body)}</div><div style='display:flex;gap:10px;'><a href='?edit=true' class='btn btn-primary'>Edit</a><a href='/notes/{filename}/delete' class='btn btn-danger' onclick='return confirm(\"Delete?\")'>Delete</a></div>"
-    return f"<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>{filename}</h1>{content}</body></html>"
+        rendered = markdown2.markdown(body, safe_mode="escape")
+        content = f"<div class='card'>{rendered}</div><div style='display:flex;gap:10px;'><a href='?edit=true' class='btn btn-primary'>Edit</a><form action='/notes/{name_u}/delete' method='post' class='inline-form' onsubmit='return confirm(\"Delete?\")'><input type='hidden' name='csrf_token' value='{h(csrf_token)}'><button type='submit' class='btn btn-danger'>Delete</button></form></div>"
+    page = f"<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>{h(name)}</h1>{content}</body></html>"
+    response = HTMLResponse(content=page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
 
 @app.get("/datasets/{filename}/full", response_class=HTMLResponse)
 def view_full_dataset(filename: str):
-    info = get_dataset_info(filename, rows_limit=1000) # Load up to 1000 rows
+    name = ensure_safe_filename(filename)
+    info = get_dataset_info(name, rows_limit=1000) # Load up to 1000 rows
     if not info: raise HTTPException(404)
-    headers = "".join([f"<th>{k}</th>" for k in info['cols']])
-    rows = "".join([f"<tr>{''.join([f'<td>{v}</td>' for v in r.values()])}</tr>" for r in info['preview']])
-    return f"<html><head>{COMMON_STYLE}</head><body style='max-width:100%'><a href='/'>← Back</a><h1>📊 {filename}</h1><div class='card' style='overflow:auto;'><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></body></html>"
+    headers = "".join([f"<th>{h(k)}</th>" for k in info['cols']])
+    rows = "".join([f"<tr>{''.join([f'<td>{h(v)}</td>' for v in r.values()])}</tr>" for r in info['preview']])
+    return f"<html><head>{COMMON_STYLE}</head><body style='max-width:100%'><a href='/'>← Back</a><h1>📊 {h(name)}</h1><div class='card' style='overflow:auto;'><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></body></html>"
 
 @app.post("/notes/{filename}/save")
-def save_note_route(filename: str, content: str = Form(...)):
-    filepath = config["notes"] / filename
+def save_note_route(request: Request, filename: str, content: str = Form(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    name = ensure_safe_filename(filename)
+    filepath = config["notes"] / name
     meta, _ = parse_note(filepath)
     save_note(filepath, meta, content)
-    return RedirectResponse(f"/notes/{filename}", status_code=303)
+    return RedirectResponse(f"/notes/{u(name)}", status_code=303)
 
-@app.get("/notes/{filename}/delete")
-def delete_note_route(filename: str):
-    (config["notes"] / filename).unlink(missing_ok=True)
+@app.post("/notes/{filename}/delete")
+def delete_note_route(request: Request, filename: str, csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    name = ensure_safe_filename(filename)
+    (config["notes"] / name).unlink(missing_ok=True)
     return RedirectResponse("/", status_code=303)
 
 @app.post("/notes/create")
-def create_note_route(filename: str = Form(...)):
-    name = filename.replace(" ", "_") + ".md"
-    save_note(config["notes"] / name, {"title": filename}, f"# {filename}")
+def create_note_route(request: Request, filename: str = Form(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    title = filename.strip()
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_") or "note"
+    name = base + ".md"
+    save_note(config["notes"] / name, {"title": title}, f"# {title}")
     return RedirectResponse("/", status_code=303)
 
 @app.post("/datasets/import")
-async def import_dataset_route(file: UploadFile = File(...)):
-    with (config["datasets"] / file.filename).open("wb") as buffer:
+async def import_dataset_route(request: Request, file: UploadFile = File(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    filename = ensure_safe_filename(file.filename)
+    if Path(filename).suffix.lower() not in {'.csv', '.json'}:
+        raise HTTPException(status_code=400, detail="Unsupported dataset format")
+    with (config["datasets"] / filename).open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     return RedirectResponse("/", status_code=303)
 
 @app.post("/videos/import")
-async def import_video_route(file: UploadFile = File(...)):
-    filename = safe_name(file.filename)
+async def import_video_route(request: Request, file: UploadFile = File(...), csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    filename = ensure_safe_filename(file.filename)
     if Path(filename).suffix.lower() not in {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}:
         raise HTTPException(status_code=400, detail="Unsupported video format")
     with (config["videos"] / filename).open("wb") as buffer:
@@ -257,16 +312,22 @@ async def import_video_route(file: UploadFile = File(...)):
     return RedirectResponse("/", status_code=303)
 
 @app.get("/videos/{filename}", response_class=HTMLResponse)
-def view_video(filename: str):
-    name = safe_name(filename)
+def view_video(request: Request, filename: str):
+    name = ensure_safe_filename(filename)
+    csrf_token = get_or_create_csrf_token(request)
     video_file = config["videos"] / name
     if not video_file.exists():
         raise HTTPException(404)
-    return f"""<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>🎬 {name}</h1><div class='card'><video id='player' controls style='width:100%;max-height:70vh;' src='/videos/{name}/stream'></video><div class='player-controls'><label for='volume'>Volume</label><input id='volume' class='volume-range' type='range' min='0' max='1' step='0.05' value='1'><button id='muteBtn' class='btn btn-primary' type='button'>Mute</button><form class='inline-form' action='/videos/{name}/delete' method='post' onsubmit='return confirm("Delete video?")'><button type='submit' class='btn btn-danger'>Delete Video</button></form></div></div><script>const player=document.getElementById('player');const volume=document.getElementById('volume');const muteBtn=document.getElementById('muteBtn');volume.addEventListener('input',()=>{{player.volume=parseFloat(volume.value);if(player.volume>0)player.muted=false;muteBtn.textContent=player.muted?'Unmute':'Mute';}});muteBtn.addEventListener('click',()=>{{player.muted=!player.muted;muteBtn.textContent=player.muted?'Unmute':'Mute';if(!player.muted&&player.volume===0){{player.volume=0.5;volume.value='0.5';}}}});</script></body></html>"""
+    name_u = u(name)
+    page = f"""<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>🎬 {h(name)}</h1><div class='card'><video id='player' controls style='width:100%;max-height:70vh;' src='/videos/{name_u}/stream'></video><div class='player-controls'><label for='volume'>Volume</label><input id='volume' class='volume-range' type='range' min='0' max='1' step='0.05' value='1'><button id='muteBtn' class='btn btn-primary' type='button'>Mute</button><form class='inline-form' action='/videos/{name_u}/delete' method='post' onsubmit='return confirm("Delete video?")'><input type='hidden' name='csrf_token' value='{h(csrf_token)}'><button type='submit' class='btn btn-danger'>Delete Video</button></form></div></div><script>const player=document.getElementById('player');const volume=document.getElementById('volume');const muteBtn=document.getElementById('muteBtn');volume.addEventListener('input',()=>{{player.volume=parseFloat(volume.value);if(player.volume>0)player.muted=false;muteBtn.textContent=player.muted?'Unmute':'Mute';}});muteBtn.addEventListener('click',()=>{{player.muted=!player.muted;muteBtn.textContent=player.muted?'Unmute':'Mute';if(!player.muted&&player.volume===0){{player.volume=0.5;volume.value='0.5';}}}});</script></body></html>"""
+    response = HTMLResponse(content=page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
 
 @app.post("/videos/{filename}/delete")
-def delete_video_route(filename: str):
-    name = safe_name(filename)
+def delete_video_route(request: Request, filename: str, csrf_token: str = Form("")):
+    validate_csrf(request, csrf_token)
+    name = ensure_safe_filename(filename)
     video_file = config["videos"] / name
     if not video_file.exists():
         raise HTTPException(404)
@@ -276,7 +337,7 @@ def delete_video_route(filename: str):
 
 @app.get("/videos/{filename}/stream")
 def stream_video(filename: str):
-    name = safe_name(filename)
+    name = ensure_safe_filename(filename)
     video_file = config["videos"] / name
     if not video_file.exists():
         raise HTTPException(404)
@@ -284,7 +345,7 @@ def stream_video(filename: str):
 
 @app.get("/videos/{filename}/thumbnail")
 def video_thumbnail(filename: str):
-    name = safe_name(filename)
+    name = ensure_safe_filename(filename)
     video_file = config["videos"] / name
     if not video_file.exists():
         raise HTTPException(404)
