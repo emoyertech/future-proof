@@ -3,16 +3,19 @@ import os, re, sys, markdown2, subprocess, datetime, shutil
 from pathlib import Path
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
 import pandas as pd
 
 # --- 1. INITIALIZATION ---
 def setup():
     base = Path.home() / ".notes"
     notes, data = base / "notes", base / "datasets"
+    videos, thumbs = base / "videos", base / "thumbnails"
     notes.mkdir(parents=True, exist_ok=True)
     data.mkdir(parents=True, exist_ok=True)
-    return {"root": base, "notes": notes, "datasets": data}
+    videos.mkdir(parents=True, exist_ok=True)
+    thumbs.mkdir(parents=True, exist_ok=True)
+    return {"root": base, "notes": notes, "datasets": data, "videos": videos, "thumbnails": thumbs}
 
 config = setup()
 app = FastAPI(title="Note & Data Hub")
@@ -50,6 +53,35 @@ def get_dataset_info(name: str, rows_limit: int = 3):
         }
     except: return {"id": name, "rows": 0, "preview": []}
 
+def safe_name(name: str) -> str:
+    return Path(name).name
+
+def thumbnail_path(video_name: str) -> Path:
+    return config["thumbnails"] / f"{Path(video_name).stem}.jpg"
+
+def generate_video_thumbnail(video_name: str) -> Optional[Path]:
+    video_file = config["videos"] / safe_name(video_name)
+    if not video_file.exists():
+        return None
+    thumb_file = thumbnail_path(video_name)
+    if thumb_file.exists() and thumb_file.stat().st_mtime >= video_file.stat().st_mtime:
+        return thumb_file
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return None
+    try:
+        subprocess.run([
+            ffmpeg_path,
+            "-y",
+            "-i", str(video_file),
+            "-ss", "00:00:01",
+            "-vframes", "1",
+            str(thumb_file)
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return thumb_file if thumb_file.exists() else None
+
 # --- 3. UI STYLES ---
 COMMON_STYLE = """
 <style>
@@ -61,6 +93,40 @@ COMMON_STYLE = """
     .btn-danger { background: #dc3545; color: white; }
     .note-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
     .preview-box { overflow-x: auto; max-height: 150px; border: 1px solid #eee; border-radius: 4px; margin-top: 10px; }
+    .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+    .video-card { border: 1px solid #eee; border-radius: 8px; background: #fff; padding: 10px; }
+    .video-thumb { width: 100%; height: 130px; object-fit: cover; border-radius: 6px; background: #f0f0f0; border: 1px solid #ddd; }
+    .video-title { font-size: 0.85em; margin: 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .video-actions { display: flex; align-items: center; justify-content: flex-start; gap: 14px; margin-top: 10px; }
+    .video-actions form { display: flex; margin: 0; }
+    .video-actions .btn,
+    .video-actions button.btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-sizing: border-box;
+        width: 112px;
+        min-width: 112px;
+        height: 36px;
+        padding: 0 10px;
+        margin: 0;
+        border: 0;
+        font-size: 0.82em;
+        line-height: 1;
+        -webkit-appearance: none;
+        appearance: none;
+    }
+    .inline-form { display: inline-flex; gap: 8px; align-items: center; }
+    .player-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+    .player-controls .btn { min-width: 120px; }
+    .player-controls .inline-form { margin-left: auto; }
+    .volume-range { width: min(220px, 100%); }
+    @media (max-width: 640px) {
+        .video-actions { flex-direction: column; align-items: stretch; gap: 10px; }
+        .video-actions .btn, .video-actions button.btn { width: 100%; min-width: 0; }
+        .player-controls .inline-form { margin-left: 0; }
+        .player-controls .btn, .player-controls .inline-form button { width: 100%; }
+    }
     table { width: 100%; border-collapse: collapse; font-size: 0.75em; }
     th, td { border: 1px solid #eee; padding: 6px; text-align: left; white-space: nowrap; }
     th { background: #f9f9f9; color: #666; }
@@ -83,6 +149,10 @@ def web_home(q: Optional[str] = None):
             <input type='file' name='file' accept='.csv,.json' style='flex-grow:1' required>
             <button type='submit' class='btn btn-success'>📥 Upload Data</button>
         </form>
+        <form action='/videos/import' method='post' enctype='multipart/form-data' style='margin-top:10px;'>
+            <input type='file' name='file' accept='video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv' style='flex-grow:1' required>
+            <button type='submit' class='btn btn-success'>🎬 Upload Video</button>
+        </form>
     </div>
     <form action='/' method='get' style='margin-bottom:20px;'>
         <input type='text' name='q' placeholder='Search notes, tags, or content...' style='flex-grow:1' value='{q or ""}'>
@@ -92,11 +162,13 @@ def web_home(q: Optional[str] = None):
     # Library Content
     notes_raw = sorted([f.name for f in config["notes"].glob("*") if f.suffix in ['.md', '.txt']])
     datasets_raw = sorted([f.name for f in config["datasets"].glob("*") if f.suffix in ['.csv', '.json']])
+    videos_raw = sorted([f.name for f in config["videos"].glob("*") if f.suffix.lower() in ['.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv']])
 
     if q:
         q = q.lower()
         notes_raw = [n for n in notes_raw if q in n.lower() or q in (config["notes"]/n).read_text().lower()]
         datasets_raw = [d for d in datasets_raw if q in d.lower()]
+        videos_raw = [v for v in videos_raw if q in v.lower()]
 
     notes_html = "".join([f"<div class='note-item'><span>{n}</span><a href='/notes/{n}' class='btn btn-primary'>View</a></div>" for n in notes_raw])
     
@@ -115,7 +187,21 @@ def web_home(q: Optional[str] = None):
             <div class='preview-box'><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div>
         </div>"""
 
-    return f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{actions_html}<div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</body></html>"
+    videos_html = ""
+    for v_name in videos_raw:
+        videos_html += f"""
+        <div class='video-card'>
+            <a href='/videos/{v_name}'><img class='video-thumb' src='/videos/{v_name}/thumbnail' alt='thumbnail for {v_name}'></a>
+            <div class='video-title'>{v_name}</div>
+            <div class='video-actions'>
+                <a href='/videos/{v_name}' class='btn btn-primary'>Watch ▶</a>
+                <form action='/videos/{v_name}/delete' method='post' onsubmit='return confirm("Delete video?")'>
+                    <button type='submit' class='btn btn-danger'>Delete</button>
+                </form>
+            </div>
+        </div>"""
+
+    return f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{actions_html}<div class='card'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}<div class='card'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
 
 @app.get("/notes/{filename}", response_class=HTMLResponse)
 def view_note(filename: str, edit: bool = False):
@@ -159,6 +245,54 @@ async def import_dataset_route(file: UploadFile = File(...)):
     with (config["datasets"] / file.filename).open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     return RedirectResponse("/", status_code=303)
+
+@app.post("/videos/import")
+async def import_video_route(file: UploadFile = File(...)):
+    filename = safe_name(file.filename)
+    if Path(filename).suffix.lower() not in {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}:
+        raise HTTPException(status_code=400, detail="Unsupported video format")
+    with (config["videos"] / filename).open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    generate_video_thumbnail(filename)
+    return RedirectResponse("/", status_code=303)
+
+@app.get("/videos/{filename}", response_class=HTMLResponse)
+def view_video(filename: str):
+    name = safe_name(filename)
+    video_file = config["videos"] / name
+    if not video_file.exists():
+        raise HTTPException(404)
+    return f"""<html><head>{COMMON_STYLE}</head><body><a href='/'>← Back</a><h1>🎬 {name}</h1><div class='card'><video id='player' controls style='width:100%;max-height:70vh;' src='/videos/{name}/stream'></video><div class='player-controls'><label for='volume'>Volume</label><input id='volume' class='volume-range' type='range' min='0' max='1' step='0.05' value='1'><button id='muteBtn' class='btn btn-primary' type='button'>Mute</button><form class='inline-form' action='/videos/{name}/delete' method='post' onsubmit='return confirm("Delete video?")'><button type='submit' class='btn btn-danger'>Delete Video</button></form></div></div><script>const player=document.getElementById('player');const volume=document.getElementById('volume');const muteBtn=document.getElementById('muteBtn');volume.addEventListener('input',()=>{{player.volume=parseFloat(volume.value);if(player.volume>0)player.muted=false;muteBtn.textContent=player.muted?'Unmute':'Mute';}});muteBtn.addEventListener('click',()=>{{player.muted=!player.muted;muteBtn.textContent=player.muted?'Unmute':'Mute';if(!player.muted&&player.volume===0){{player.volume=0.5;volume.value='0.5';}}}});</script></body></html>"""
+
+@app.post("/videos/{filename}/delete")
+def delete_video_route(filename: str):
+    name = safe_name(filename)
+    video_file = config["videos"] / name
+    if not video_file.exists():
+        raise HTTPException(404)
+    video_file.unlink(missing_ok=True)
+    thumbnail_path(name).unlink(missing_ok=True)
+    return RedirectResponse("/", status_code=303)
+
+@app.get("/videos/{filename}/stream")
+def stream_video(filename: str):
+    name = safe_name(filename)
+    video_file = config["videos"] / name
+    if not video_file.exists():
+        raise HTTPException(404)
+    return FileResponse(video_file)
+
+@app.get("/videos/{filename}/thumbnail")
+def video_thumbnail(filename: str):
+    name = safe_name(filename)
+    video_file = config["videos"] / name
+    if not video_file.exists():
+        raise HTTPException(404)
+    thumb = generate_video_thumbnail(name)
+    if thumb and thumb.exists():
+        return FileResponse(thumb)
+    fallback_svg = """<svg xmlns='http://www.w3.org/2000/svg' width='640' height='360'><rect width='100%' height='100%' fill='#f0f0f0'/><circle cx='320' cy='180' r='48' fill='#d9d9d9'/><polygon points='305,155 305,205 350,180' fill='#9e9e9e'/><text x='50%' y='300' text-anchor='middle' fill='#7a7a7a' font-family='Arial' font-size='22'>No thumbnail available</text></svg>"""
+    return Response(content=fallback_svg, media_type="image/svg+xml")
 
 if __name__ == "__main__":
     subprocess.run(["uvicorn", f"{Path(__file__).stem}:app", "--reload", "--port", "8080"])

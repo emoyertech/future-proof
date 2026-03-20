@@ -20,6 +20,11 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
+    conn.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL
+    )''')
     
     # 1. Ensure the table exists
     conn.execute('''CREATE TABLE IF NOT EXISTS vehicles (
@@ -38,7 +43,9 @@ def init_db():
         "location": "TEXT",
         "year": "INTEGER",
         "mileage": "INTEGER",
-        "user_id": "INTEGER"
+        "user_id": "INTEGER",
+        "lat": "REAL",
+        "lng": "REAL"
     }
 
     for col, col_type in required.items():
@@ -79,6 +86,14 @@ def home():
 @app.route('/create', methods=['POST'])
 @login_required
 def create_listing():
+    def to_int(value, default=0):
+        try:
+            if value is None or str(value).strip() == '':
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     files = request.files.getlist('photos')
     filenames = []
     for file in files:
@@ -93,9 +108,18 @@ def create_listing():
         conn = get_db_connection()
         conn.execute('''INSERT INTO vehicles (user_id, make, model, year, price, mileage, location, lat, lng, image_path) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (session['user_id'], request.form['make'], request.form['model'], 
-                      request.form['year'], request.form['price'], request.form['mileage'], 
-                      request.form['location'], request.form.get('lat'), request.form.get('lng'), image_string))
+                            (
+                                session['user_id'],
+                                request.form.get('make', '').strip(),
+                                request.form.get('model', '').strip(),
+                                to_int(request.form.get('year')),
+                                to_int(request.form.get('price')),
+                                to_int(request.form.get('mileage')),
+                                request.form.get('location', '').strip(),
+                                request.form.get('lat'),
+                                request.form.get('lng'),
+                                image_string,
+                            ))
         conn.commit()
         conn.close()
     return redirect(url_for('home'))

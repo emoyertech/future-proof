@@ -16,8 +16,11 @@
         <div>{% if session.username %}{{ session.username }} | <a href="/logout">Logout</a>{% endif %}</div>
     </div>
     <div class="container">
-        <!-- CRITICAL: THIS NAME MUST BE 'main' -->
-        {% block main %}{% endblock %}
+        {% block main %}
+            {% block main_content %}
+                {% block content %}{% endblock %}
+            {% endblock %}
+        {% endblock %}
     </div>
 </body>
 </html>
