@@ -107,6 +107,9 @@ On the home page (`/`), users can:
 - Upload videos (MP4/MOV/M4V/WEBM/AVI/MKV)
 - Search/import public text files
 - Search/import YouTube videos (with progress bar)
+- See latest headlines from major news sources (CNN, NYT, WSJ, The Economist, Google News, Apple News, BBC, NBC)
+- Refresh news manually or let it auto-refresh every 5 minutes
+- See a relative update indicator (for example: "Updated 2m ago")
 - Search existing library content
 - Open social sections (chat, follow lists, profile links)
 - Play mini games (Tetris style, Frogger style, Word Guess, Hangman)

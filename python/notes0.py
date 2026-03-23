@@ -36,6 +36,9 @@ import io
 import random
 import threading
 import uuid
+import time
+import concurrent.futures
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import quote, urlparse
@@ -69,6 +72,18 @@ app = FastAPI(title="Note & Data Hub")
 YOUTUBE_IMPORT_JOBS = {}
 YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
 GAME_TYPES = ("tetris", "frogger", "word_guess", "hangman")
+NEWS_SOURCES = [
+    ("CNN", "http://rss.cnn.com/rss/edition.rss"),
+    ("The New York Times", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
+    ("The Wall Street Journal", "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
+    ("The Economist", "https://www.economist.com/international/rss.xml"),
+    ("Google News", "https://news.google.com/rss"),
+    ("Apple News", "https://www.apple.com/newsroom/rss-feed.rss"),
+    ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
+    ("NBC News", "https://feeds.nbcnews.com/nbcnews/public/news"),
+]
+NEWS_CACHE_LOCK = threading.Lock()
+NEWS_CACHE = {"expires_at": 0.0, "items": []}
 
 # --- 2. CORE LOGIC ---
 def parse_note(f: Path):
@@ -410,6 +425,71 @@ def run_youtube_import_job(job_id: str, video_url: str, user_snapshot, private_u
         set_youtube_job(job_id, status="completed", progress=100.0, filename=imported_file, message="Import complete")
     except Exception as ex:
         set_youtube_job(job_id, status="error", message=str(ex))
+
+def fetch_rss_headline(source_name: str, rss_url: str) -> dict:
+    """Fetch one latest headline/link from a news RSS feed."""
+    try:
+        req = UrlRequest(rss_url, headers={"User-Agent": "future-proof-notes/1.0"})
+        with urlopen(req, timeout=4) as response:
+            xml_text = response.read().decode("utf-8", errors="replace")
+        root = ET.fromstring(xml_text)
+
+        item = root.find("./channel/item")
+        if item is not None:
+            title = (item.findtext("title") or "Latest headline").strip()
+            link = (item.findtext("link") or "").strip()
+            if title and link:
+                return {"source": source_name, "title": title, "link": link, "ok": True}
+
+        entry = root.find("{http://www.w3.org/2005/Atom}entry")
+        if entry is not None:
+            title = (entry.findtext("{http://www.w3.org/2005/Atom}title") or "Latest headline").strip()
+            link_node = entry.find("{http://www.w3.org/2005/Atom}link")
+            link = (link_node.attrib.get("href", "") if link_node is not None else "").strip()
+            if title and link:
+                return {"source": source_name, "title": title, "link": link, "ok": True}
+
+    except Exception:
+        pass
+    return {"source": source_name, "title": "News temporarily unavailable", "link": "", "ok": False}
+
+def fetch_latest_news(force_refresh: bool = False) -> List[dict]:
+    """Fetch and cache one headline per configured news source."""
+    now = time.time()
+    with NEWS_CACHE_LOCK:
+        if not force_refresh and NEWS_CACHE["items"] and NEWS_CACHE["expires_at"] > now:
+            return NEWS_CACHE["items"]
+
+    collected = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {
+            executor.submit(fetch_rss_headline, source_name, rss_url): source_name
+            for source_name, rss_url in NEWS_SOURCES
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                collected.append(future.result())
+            except Exception:
+                source_name = future_map[future]
+                collected.append({"source": source_name, "title": "News temporarily unavailable", "link": "", "ok": False})
+
+    order = {name: idx for idx, (name, _) in enumerate(NEWS_SOURCES)}
+    collected.sort(key=lambda item: order.get(item["source"], 999))
+
+    with NEWS_CACHE_LOCK:
+        NEWS_CACHE["items"] = collected
+        NEWS_CACHE["expires_at"] = now + 300
+    return collected
+
+def render_news_rows_html(news_items: List[dict]) -> str:
+    """Render latest-news entries as home-card HTML rows."""
+    rows = ""
+    for item in news_items:
+        if item.get("ok") and item.get("link"):
+            rows += f"<div class='note-item'><div><strong>{h(item['source'])}</strong><br><a href='{h(item['link'])}' target='_blank' rel='noopener'>{h(item['title'])}</a></div></div>"
+        else:
+            rows += f"<div class='note-item'><div><strong>{h(item['source'])}</strong><br><small>{h(item['title'])}</small></div></div>"
+    return rows
 
 def h(value) -> str:
     """HTML-escape any value for safe interpolation in templates."""
@@ -2312,6 +2392,15 @@ def notifications_page(request: Request):
     response.set_cookie("csrf_token", csrf_token, samesite="lax")
     return response
 
+@app.get("/news/latest")
+def latest_news_route(force: int = 0):
+    """Return latest news headlines for dashboard refresh calls."""
+    items = fetch_latest_news(force_refresh=bool(force))
+    return {
+        "fetched_at": datetime.datetime.utcnow().isoformat(),
+        "items": items,
+    }
+
 # Main web home/dashboard route
 @app.get("/", response_class=HTMLResponse)
 def web_home(
@@ -2359,6 +2448,7 @@ def web_home(
         <div class='nav-pills'>
             <a href='#uploads' class='btn btn-secondary'>Uploads</a>
             <a href='#recommendations' class='btn btn-secondary'>Recommendations</a>
+            <a href='#news' class='btn btn-secondary'>News</a>
             <a href='#notes' class='btn btn-secondary'>Notes</a>
             <a href='#data' class='btn btn-secondary'>Data</a>
             <a href='#videos' class='btn btn-secondary'>Videos</a>
@@ -2566,6 +2656,22 @@ def web_home(
     else:
         recommendations_html = "<div class='card' id='recommendations'><h2>✨ From People You Follow</h2><p>Sign in and follow users to get personalized recommendations.</p></div>"
 
+    # Build latest-news card content (cached server-side; refreshed client-side).
+    news_items = fetch_latest_news()
+    news_rows = render_news_rows_html(news_items)
+    news_html = f"""
+    <div class='card' id='news'>
+        <div style='display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;'>
+            <h2 style='margin:0;'>🗞️ Latest News</h2>
+            <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>
+                <small id='newsUpdatedLabel' class='helper' style='margin:0;'>Updated just now · Auto-refresh every 5 minutes</small>
+                <button id='refreshNewsBtn' type='button' class='btn btn-secondary'>Refresh News</button>
+            </div>
+        </div>
+        <div id='newsRows'>{news_rows}</div>
+    </div>
+    """
+
     games_html = """
     <div class='card' id='games'>
         <h2>🎮 Mini Games</h2>
@@ -2738,13 +2844,72 @@ def web_home(
             </div>
         </div>"""
 
-    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}{games_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
+    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{news_html}{actions_html}{text_search_html}{yt_search_html}{games_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
     (function() {{
-        // Lightweight polling client for async YouTube imports.
+        // Dashboard client helpers: YouTube import polling + latest-news refresh UI.
         const progressWrap = document.getElementById('ytProgressWrap');
         const progressBar = document.getElementById('ytProgressBar');
         const progressLabel = document.getElementById('ytProgressLabel');
         const forms = Array.from(document.querySelectorAll("form[action='/videos/import-youtube']"));
+        const refreshNewsBtn = document.getElementById('refreshNewsBtn');
+        const newsRows = document.getElementById('newsRows');
+        const newsUpdatedLabel = document.getElementById('newsUpdatedLabel');
+        let newsLastUpdatedMs = Date.now();
+
+        function escapeHtml(value) {{
+            return String(value || '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }}
+
+        function renderNewsRows(items) {{
+            if (!newsRows) return;
+            newsRows.innerHTML = (items || []).map(function(item) {{
+                const source = escapeHtml((item && item.source) ? item.source : 'Source');
+                const title = escapeHtml((item && item.title) ? item.title : 'News temporarily unavailable');
+                const link = (item && item.link) ? item.link : '';
+                if (item && item.ok && link) {{
+                    return "<div class='note-item'><div><strong>" + source + "</strong><br><a href='" + link + "' target='_blank' rel='noopener'>" + title + "</a></div></div>";
+                }}
+                return "<div class='note-item'><div><strong>" + source + "</strong><br><small>" + title + "</small></div></div>";
+            }}).join('');
+        }}
+
+        function formatRelativeAge(msSinceUpdate) {{
+            const seconds = Math.floor(msSinceUpdate / 1000);
+            if (seconds < 10) return 'just now';
+            if (seconds < 60) return seconds + 's ago';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return minutes + 'm ago';
+            const hours = Math.floor(minutes / 60);
+            return hours + 'h ago';
+        }}
+
+        function updateNewsLabel(prefix) {{
+            if (!newsUpdatedLabel) return;
+            const age = formatRelativeAge(Date.now() - newsLastUpdatedMs);
+            const head = prefix ? (prefix + ' · ') : '';
+            newsUpdatedLabel.textContent = head + 'Updated ' + age + ' · Auto-refresh every 5 minutes';
+        }}
+
+        async function refreshNews(force) {{
+            if (!newsRows) return;
+            try {{
+                // `force=1` bypasses server cache for manual refresh button clicks.
+                const suffix = force ? '?force=1' : '';
+                const resp = await fetch('/news/latest' + suffix);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                renderNewsRows(data.items || []);
+                newsLastUpdatedMs = Date.now();
+                updateNewsLabel(force ? 'Refreshed' : 'Auto-refreshed');
+            }} catch (_) {{
+                if (newsUpdatedLabel) newsUpdatedLabel.textContent = 'News refresh failed. Auto-retry in 5 minutes.';
+            }}
+        }}
 
         async function startImport(form) {{
             // Start job, then poll progress endpoint until completion/error.
@@ -2794,6 +2959,21 @@ def web_home(
                 startImport(form);
             }});
         }}
+
+        if (refreshNewsBtn) {{
+            refreshNewsBtn.addEventListener('click', function() {{
+                refreshNews(true);
+            }});
+        }}
+        // Keep the relative “updated X ago” text fresh between fetches.
+        updateNewsLabel('Loaded');
+        setInterval(function() {{
+            updateNewsLabel('Loaded');
+        }}, 10000);
+        // Pull fresh headlines every 5 minutes.
+        setInterval(function() {{
+            refreshNews(false);
+        }}, 300000);
     }})();
     </script></html>"""
     response = HTMLResponse(content=page)
