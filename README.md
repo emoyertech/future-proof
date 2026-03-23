@@ -13,6 +13,60 @@ This project serves as an educational tool for students to learn file manipulati
 
 It's `future-proof` because of its reliance on text files kept in a special directory.
 
+## Quick Start (Python App)
+
+Run the current Python web app implementation from the `python` folder:
+
+Terminal programs needed:
+
+- Required: `python3`, `pip3` (or `python3 -m pip`)
+- Optional: `yt-dlp` (YouTube import), `ffmpeg` (thumbnails)
+
+Check availability:
+
+```bash
+command -v python3
+command -v pip3
+command -v yt-dlp
+command -v ffmpeg
+```
+
+```bash
+cd python
+pip install fastapi uvicorn markdown2 pandas python-multipart
+python3 notes0.py
+```
+
+Open http://127.0.0.1:8080
+
+Optional tooling for full features:
+
+- `yt-dlp` for YouTube search/import
+- `ffmpeg` for video thumbnail generation
+
+macOS install:
+
+```bash
+brew install yt-dlp ffmpeg
+```
+
+Quick troubleshooting:
+
+- If install fails, try `python3 -m pip install --upgrade pip` then re-run `pip install ...`.
+- If port `8080` is busy, stop the conflicting process or run with uvicorn on another port.
+- If YouTube import/search fails, verify `yt-dlp` is installed and on `PATH`.
+- If thumbnails do not appear, verify `ffmpeg` is installed and restart the app.
+
+For full details on features, setup, API routes, and user workflows, see:
+- [python/README.md](python/README.md)
+
+Before reporting bugs, run the Support Checklist in:
+- [python/README.md#support-checklist-before-reporting-a-bug](python/README.md#support-checklist-before-reporting-a-bug)
+- [python/README.md#notify-admins-in-app](python/README.md#notify-admins-in-app)
+- [python/README.md#bug-report-template](python/README.md#bug-report-template)
+
+In-app shortcut: click **Report Issue** to open a prefilled admin message form.
+
 Developers often create their own tools, programs they maintain for their own use.
 This project 
 

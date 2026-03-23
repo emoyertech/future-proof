@@ -114,6 +114,7 @@ On the home page (`/`), users can:
 - Open social sections (chat, follow lists, profile links)
 - Play mini games (Tetris style, Frogger style, Word Guess, Hangman)
 - View shared game leaderboards across users
+- Personalize home sections (hide/show panels) and keep preferences when signed in
 - Use display controls (theme/layout/custom presets)
 
 Additional pages:

@@ -72,6 +72,20 @@ app = FastAPI(title="Note & Data Hub")
 YOUTUBE_IMPORT_JOBS = {}
 YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
 GAME_TYPES = ("tetris", "frogger", "word_guess", "hangman")
+HOME_PANEL_IDS = [
+    "uploads",
+    "text-search",
+    "youtube-search",
+    "notes",
+    "data",
+    "videos",
+    "setup",
+    "recommendations",
+    "news",
+    "games",
+    "chat",
+    "social",
+]
 NEWS_SOURCES = [
     ("CNN", "http://rss.cnn.com/rss/edition.rss"),
     ("The New York Times", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
@@ -653,6 +667,14 @@ def init_auth_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id INTEGER PRIMARY KEY,
+            home_hidden_panels TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    ''')
     msg_cols = [row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
     user_cols = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
     if "public_name" not in user_cols:
@@ -762,6 +784,51 @@ def get_unread_notification_count(user_id: int) -> int:
     ).fetchone()
     conn.close()
     return row["c"] if row else 0
+
+def normalize_home_hidden_panels(value) -> List[str]:
+    """Normalize and validate hidden panel ids for home-dashboard preferences."""
+    if not isinstance(value, list):
+        return []
+    allowed = set(HOME_PANEL_IDS)
+    clean = []
+    for item in value:
+        panel_id = str(item).strip()
+        if panel_id in allowed and panel_id not in clean:
+            clean.append(panel_id)
+    return clean
+
+def get_user_home_hidden_panels(user_id: int) -> List[str]:
+    """Return account-level home hidden-panel preferences."""
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT home_hidden_panels FROM user_preferences WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return []
+    try:
+        parsed = json.loads(row["home_hidden_panels"] or "[]")
+    except Exception:
+        parsed = []
+    return normalize_home_hidden_panels(parsed)
+
+def set_user_home_hidden_panels(user_id: int, hidden_panels: List[str]):
+    """Persist account-level home hidden-panel preferences."""
+    safe_panels = normalize_home_hidden_panels(hidden_panels)
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO user_preferences (user_id, home_hidden_panels, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            home_hidden_panels=excluded.home_hidden_panels,
+            updated_at=excluded.updated_at
+        """,
+        (user_id, json.dumps(safe_panels), datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
 def submit_game_score(user_id: int, game_name: str, score: int):
     """Persist a user's score for a supported mini game."""
@@ -1116,7 +1183,7 @@ def generate_video_thumbnail(video_name: str) -> Optional[Path]:
 # --- 3. UI STYLES ---
 COMMON_STYLE = """
 <style>
-    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px; background: #f8f9fa; color: #333; transition: background .2s ease, color .2s ease; }
+    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px; line-height: 1.45; background: #f8f9fa; color: #333; transition: background .2s ease, color .2s ease; }
     .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease; }
     body.theme-dark { background: #121212; color: #e8e8e8; }
     body.theme-dark .card { background: #1f1f1f; color: #e8e8e8; box-shadow: 0 2px 4px rgba(0,0,0,0.45); }
@@ -1162,6 +1229,41 @@ COMMON_STYLE = """
     .btn-danger { background: #dc3545; color: white; }
     .btn-secondary { background: #6c757d; color: white; }
     .home-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: start; }
+    .home-grid > .stack { min-width: 0; }
+    .stack { display: flex; flex-direction: column; gap: 12px; }
+    .home-col-primary { gap: 14px; }
+    .home-col-secondary { gap: 14px; }
+    .home-col-secondary-sticky { position: sticky; top: 72px; align-self: start; }
+    .stack .card { margin-bottom: 0; }
+    .section-card h2, .section-card h3 { margin-top: 0; }
+    .section-card h2 { margin-bottom: 10px; }
+    .section-title { margin: 0 0 8px; font-size: 1.05em; }
+    .home-toolbar-card { padding-top: 14px; padding-bottom: 12px; }
+    .home-toolbar-card .nav-pills { margin-bottom: 2px; }
+    .dashboard-panel { position: relative; }
+    .panel-toggle-btn {
+        padding: 4px 8px;
+        border: 1px solid #d9d9d9;
+        border-radius: 999px;
+        background: #fff;
+        color: #555;
+        font-size: 0.74em;
+        cursor: pointer;
+        margin-left: 8px;
+    }
+    .panel-toggle-btn:hover { background: #f3f3f3; }
+    .panel-header-anchor {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-height: 28px;
+    }
+    .panel-collapsed .panel-body { display: none; }
+    .panel-collapsed { border: 1px solid #e8e8e8; }
+    body.theme-dark .panel-toggle-btn { background: #232323; color: #ddd; border-color: #3b3b3b; }
+    body.theme-dark .panel-toggle-btn:hover { background: #2c2c2c; }
+    body.theme-dark .panel-collapsed { border-color: #3a3a3a; }
     .chat-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
     .chat-item { border: 1px solid #eee; border-radius: 6px; padding: 10px; background: #fafafa; }
     .chat-meta { color: #666; font-size: 0.75em; margin-bottom: 4px; }
@@ -1206,11 +1308,16 @@ COMMON_STYLE = """
     .volume-range { width: min(220px, 100%); }
     @media (max-width: 640px) {
         .home-grid { grid-template-columns: 1fr; }
+        .home-col-secondary-sticky { position: static; }
         .social-grid { grid-template-columns: 1fr; }
         .video-actions { flex-direction: column; align-items: stretch; gap: 10px; }
         .video-actions .btn, .video-actions button.btn { width: 100%; min-width: 0; }
         .player-controls .inline-form { margin-left: 0; }
         .player-controls .btn, .player-controls .inline-form button { width: 100%; }
+    }
+    @media (max-width: 980px) {
+        .home-grid { grid-template-columns: 1fr; }
+        .home-col-secondary-sticky { position: static; }
     }
     table { width: 100%; border-collapse: collapse; font-size: 0.75em; }
     th, td { border: 1px solid #eee; padding: 6px; text-align: left; white-space: nowrap; }
@@ -2401,6 +2508,24 @@ def latest_news_route(force: int = 0):
         "items": items,
     }
 
+@app.post("/home/panels")
+def save_home_panel_preferences_route(
+    request: Request,
+    hidden_panels_json: str = Form("[]"),
+    csrf_token: str = Form(""),
+):
+    """Persist signed-in user's home panel visibility preferences."""
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login required")
+    try:
+        hidden_panels = json.loads(hidden_panels_json)
+    except Exception:
+        hidden_panels = []
+    set_user_home_hidden_panels(user["id"], hidden_panels)
+    return {"ok": True, "hidden_panels": normalize_home_hidden_panels(hidden_panels)}
+
 # Main web home/dashboard route
 @app.get("/", response_class=HTMLResponse)
 def web_home(
@@ -2418,6 +2543,8 @@ def web_home(
     """Render the main dashboard aggregating uploads, discovery, and social features."""
     csrf_token = get_or_create_csrf_token(request)
     user = get_current_user(request)
+    account_hidden_panels = get_user_home_hidden_panels(user["id"]) if user else []
+    account_hidden_panels_json = json.dumps(account_hidden_panels)
     setup_checks = get_setup_checks()
     missing_checks = [item for item in setup_checks if not item["ok"]]
     auth_html = ""
@@ -2444,7 +2571,7 @@ def web_home(
         global_notice_html = "<div class='card notice-bad'>Dataset action failed.</div>"
 
     quick_nav_html = """
-    <div class='card'>
+    <div class='card home-toolbar-card'>
         <div class='nav-pills'>
             <a href='#uploads' class='btn btn-secondary'>Uploads</a>
             <a href='#recommendations' class='btn btn-secondary'>Recommendations</a>
@@ -2454,6 +2581,8 @@ def web_home(
             <a href='#videos' class='btn btn-secondary'>Videos</a>
             <a href='#social' class='btn btn-secondary'>Social</a>
             <a href='#games' class='btn btn-secondary'>Games</a>
+            <button id='resetPanelsBtn' type='button' class='btn btn-secondary'>Reset Panels</button>
+            <span id='collapsedPanelsCount' class='helper' style='margin:0 0 0 auto;'>0 hidden</span>
         </div>
     </div>
     """
@@ -2569,7 +2698,7 @@ def web_home(
             text_results_html = f"<p>{h(text_search_error)}</p>"
         elif not text_results_html and text_q:
             text_results_html = "<p>No public text files found.</p>"
-        text_search_html = f"<div class='card'><h2>📚 Public Text Search</h2>{text_search_status_html}{text_results_html}</div>"
+        text_search_html = f"<div class='card dashboard-panel' id='text-search'><h2>📚 Public Text Search</h2>{text_search_status_html}{text_results_html}</div>"
 
     yt_search_status_html = ""
     if yt_status == "imported":
@@ -2610,7 +2739,7 @@ def web_home(
 
     yt_search_html = ""
     if yt_q or yt_status:
-        yt_search_html = f"<div class='card'><h2>🎥 YouTube Search</h2>{yt_search_status_html}{yt_results_html}</div>"
+        yt_search_html = f"<div class='card dashboard-panel' id='youtube-search'><h2>🎥 YouTube Search</h2>{yt_search_status_html}{yt_results_html}</div>"
 
     setup_html = ""
     if missing_checks:
@@ -2619,14 +2748,14 @@ def web_home(
             for item in missing_checks
         ])
         setup_html = f"""
-        <div class='card'>
+        <div class='card dashboard-panel' id='setup'>
             <h2>⚙️ Setup Required</h2>
             <p>Install the missing tools below to enable all website features:</p>
             {rows}
         </div>
         """
     elif text_q or yt_q or text_status or yt_status:
-        setup_html = "<div class='card'><h2>⚙️ Setup</h2><p>All optional tooling is available.</p></div>"
+        setup_html = "<div class='card dashboard-panel' id='setup'><h2>⚙️ Setup</h2><p>All optional tooling is available.</p></div>"
 
     recommendations_html = ""
     if user:
@@ -2648,19 +2777,19 @@ def web_home(
                 </div>
                 """
             if rec_rows:
-                recommendations_html = f"<div class='card' id='recommendations'><h2>✨ From People You Follow</h2>{rec_rows}</div>"
+                recommendations_html = f"<div class='card dashboard-panel' id='recommendations'><h2>✨ From People You Follow</h2>{rec_rows}</div>"
         elif get_following_rows(user["id"]):
-            recommendations_html = "<div class='card' id='recommendations'><h2>✨ From People You Follow</h2><p>No recent public uploads from people you follow.</p></div>"
+            recommendations_html = "<div class='card dashboard-panel' id='recommendations'><h2>✨ From People You Follow</h2><p>No recent public uploads from people you follow.</p></div>"
         else:
-            recommendations_html = "<div class='card' id='recommendations'><h2>✨ From People You Follow</h2><p>Follow users to get personalized recommendations here.</p></div>"
+            recommendations_html = "<div class='card dashboard-panel' id='recommendations'><h2>✨ From People You Follow</h2><p>Follow users to get personalized recommendations here.</p></div>"
     else:
-        recommendations_html = "<div class='card' id='recommendations'><h2>✨ From People You Follow</h2><p>Sign in and follow users to get personalized recommendations.</p></div>"
+        recommendations_html = "<div class='card dashboard-panel' id='recommendations'><h2>✨ From People You Follow</h2><p>Sign in and follow users to get personalized recommendations.</p></div>"
 
     # Build latest-news card content (cached server-side; refreshed client-side).
     news_items = fetch_latest_news()
     news_rows = render_news_rows_html(news_items)
     news_html = f"""
-    <div class='card' id='news'>
+    <div class='card dashboard-panel' id='news'>
         <div style='display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;'>
             <h2 style='margin:0;'>🗞️ Latest News</h2>
             <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>
@@ -2673,7 +2802,7 @@ def web_home(
     """
 
     games_html = """
-    <div class='card' id='games'>
+    <div class='card dashboard-panel' id='games'>
         <h2>🎮 Mini Games</h2>
         <div class='nav-pills'>
             <a href='/games/tetris' class='btn btn-primary'>Tetris Style</a>
@@ -2844,7 +2973,31 @@ def web_home(
             </div>
         </div>"""
 
-    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{news_html}{actions_html}{text_search_html}{yt_search_html}{games_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
+    # Home dashboard layout: primary content on left, contextual/social panels on right.
+    primary_column_html = f"""
+    <div class='stack home-col-primary'>
+        <div class='card section-card'><h3 class='section-title'>Work Area</h3><p class='helper'>Create and search content, then manage notes, data, and videos.</p></div>
+        {actions_html.replace("<div class='card' id='uploads'>", "<div class='card dashboard-panel section-card' id='uploads'>")}
+        {text_search_html}
+        {yt_search_html}
+        <div class='card section-card dashboard-panel' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>
+        <div class='card section-card dashboard-panel' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div>
+        <div class='card section-card dashboard-panel' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div>
+    </div>
+    """
+    secondary_column_html = f"""
+    <div class='stack home-col-secondary home-col-secondary-sticky'>
+        <div class='card section-card'><h3 class='section-title'>Updates & Community</h3><p class='helper'>Setup status, recommendations, news, games, chat, and social activity.</p></div>
+        {setup_html}
+        {recommendations_html}
+        {news_html}
+        {games_html}
+        {chat_html.replace("<div class='card'>", "<div class='card dashboard-panel' id='chat'>", 1)}
+        {follow_html.replace("<div class='card' id='social'>", "<div class='card dashboard-panel' id='social'>")}
+    </div>
+    """
+
+    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}<div class='home-grid'>{primary_column_html}{secondary_column_html}</div></body><script>
     (function() {{
         // Dashboard client helpers: YouTube import polling + latest-news refresh UI.
         const progressWrap = document.getElementById('ytProgressWrap');
@@ -2854,6 +3007,12 @@ def web_home(
         const refreshNewsBtn = document.getElementById('refreshNewsBtn');
         const newsRows = document.getElementById('newsRows');
         const newsUpdatedLabel = document.getElementById('newsUpdatedLabel');
+        const resetPanelsBtn = document.getElementById('resetPanelsBtn');
+        const collapsedPanelsCount = document.getElementById('collapsedPanelsCount');
+        const panelStorageKey = 'fp_hidden_home_panels';
+        const isSignedInUser = """ + ("true" if user else "false") + """;
+        const accountHiddenPanels = """ + account_hidden_panels_json + """;
+        const allPanelIds = """ + json.dumps(HOME_PANEL_IDS) + """;
         let newsLastUpdatedMs = Date.now();
 
         function escapeHtml(value) {{
@@ -2909,6 +3068,128 @@ def web_home(
             }} catch (_) {{
                 if (newsUpdatedLabel) newsUpdatedLabel.textContent = 'News refresh failed. Auto-retry in 5 minutes.';
             }}
+        }}
+
+        function readHiddenPanels() {{
+            if (isSignedInUser) return new Set(accountHiddenPanels);
+            try {{
+                const parsed = JSON.parse(localStorage.getItem(panelStorageKey) || '[]');
+                return new Set(Array.isArray(parsed) ? parsed : []);
+            }} catch (_) {{
+                return new Set();
+            }}
+        }}
+
+        function writeHiddenPanels(hiddenSet) {{
+            localStorage.setItem(panelStorageKey, JSON.stringify(Array.from(hiddenSet)));
+        }}
+
+        function updateCollapsedPanelsCount() {{
+            if (!collapsedPanelsCount) return;
+            const hidden = document.querySelectorAll('.dashboard-panel.panel-collapsed').length;
+            collapsedPanelsCount.textContent = hidden + (hidden === 1 ? ' panel hidden' : ' panels hidden');
+        }}
+
+        async function syncHiddenPanelsToAccount(hiddenSet) {{
+            if (!isSignedInUser) return;
+            try {{
+                const body = new URLSearchParams();
+                body.set('csrf_token', '""" + h(csrf_token) + """');
+                body.set('hidden_panels_json', JSON.stringify(Array.from(hiddenSet)));
+                await fetch('/home/panels', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                    body: body.toString(),
+                }});
+            }} catch (_) {{}}
+        }}
+
+        function initDashboardPanels() {{
+            const manageableIds = new Set(allPanelIds);
+            const hiddenPanels = readHiddenPanels();
+            const cards = Array.from(document.querySelectorAll('.dashboard-panel'));
+
+            for (const card of cards) {{
+                const panelId = card.id;
+                if (!panelId || !manageableIds.has(panelId)) continue;
+
+                const directChildren = Array.from(card.children);
+                if (!directChildren.length) continue;
+
+                let headerNode = directChildren.find((node) => node.querySelector && node.querySelector('h2,h3')) || directChildren[0];
+                if (headerNode && (headerNode.tagName === 'H2' || headerNode.tagName === 'H3')) {{
+                    const anchor = document.createElement('div');
+                    anchor.className = 'panel-header-anchor';
+                    headerNode.parentNode.insertBefore(anchor, headerNode);
+                    anchor.appendChild(headerNode);
+                    headerNode = anchor;
+                }} else if (headerNode && headerNode.classList) {{
+                    headerNode.classList.add('panel-header-anchor');
+                }}
+
+                let body = card.querySelector(':scope > .panel-body');
+                if (!body) {{
+                    body = document.createElement('div');
+                    body.className = 'panel-body';
+                    const childrenNow = Array.from(card.children);
+                    const headerIndex = childrenNow.indexOf(headerNode);
+                    for (let idx = headerIndex + 1; idx < childrenNow.length; idx++) {{
+                        body.appendChild(childrenNow[idx]);
+                    }}
+                    card.appendChild(body);
+                }}
+
+                if (!card.querySelector(':scope > .panel-header-anchor .panel-toggle-btn, :scope > .panel-toggle-btn')) {{
+                    const toggleBtn = document.createElement('button');
+                    toggleBtn.type = 'button';
+                    toggleBtn.className = 'panel-toggle-btn';
+                    const applyState = (collapsed) => {{
+                        card.classList.toggle('panel-collapsed', collapsed);
+                        toggleBtn.textContent = collapsed ? 'Show' : 'Hide';
+                        toggleBtn.setAttribute('aria-expanded', String(!collapsed));
+                    }};
+
+                    applyState(hiddenPanels.has(panelId));
+                    toggleBtn.addEventListener('click', function() {{
+                        const nextCollapsed = !card.classList.contains('panel-collapsed');
+                        if (nextCollapsed) {{
+                            const visibleCount = document.querySelectorAll('.dashboard-panel:not(.panel-collapsed)').length;
+                            if (visibleCount <= 3) {{
+                                if (collapsedPanelsCount) collapsedPanelsCount.textContent = 'Keep at least 3 panels visible';
+                                return;
+                            }}
+                        }}
+                        applyState(nextCollapsed);
+                        if (nextCollapsed) hiddenPanels.add(panelId); else hiddenPanels.delete(panelId);
+                        writeHiddenPanels(hiddenPanels);
+                        syncHiddenPanelsToAccount(hiddenPanels);
+                        updateCollapsedPanelsCount();
+                    }});
+
+                    if (headerNode && headerNode.appendChild) headerNode.appendChild(toggleBtn);
+                    else card.insertBefore(toggleBtn, card.firstChild);
+                }}
+            }}
+
+            if (resetPanelsBtn) {{
+                resetPanelsBtn.addEventListener('click', function() {{
+                    localStorage.removeItem(panelStorageKey);
+                    for (const card of document.querySelectorAll('.dashboard-panel.panel-collapsed')) {{
+                        card.classList.remove('panel-collapsed');
+                        const btn = card.querySelector('.panel-toggle-btn');
+                        if (btn) {{
+                            btn.textContent = 'Hide';
+                            btn.setAttribute('aria-expanded', 'true');
+                        }}
+                    }}
+                    const cleared = new Set();
+                    writeHiddenPanels(cleared);
+                    syncHiddenPanelsToAccount(cleared);
+                    updateCollapsedPanelsCount();
+                }});
+            }}
+
+            updateCollapsedPanelsCount();
         }}
 
         async function startImport(form) {{
@@ -2967,6 +3248,7 @@ def web_home(
         }}
         // Keep the relative “updated X ago” text fresh between fetches.
         updateNewsLabel('Loaded');
+        initDashboardPanels();
         setInterval(function() {{
             updateNewsLabel('Loaded');
         }}, 10000);
