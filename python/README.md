@@ -109,6 +109,8 @@ On the home page (`/`), users can:
 - Search/import YouTube videos (with progress bar)
 - Search existing library content
 - Open social sections (chat, follow lists, profile links)
+- Play mini games (Tetris style, Frogger style, Word Guess, Hangman)
+- View shared game leaderboards across users
 - Use display controls (theme/layout/custom presets)
 
 Additional pages:

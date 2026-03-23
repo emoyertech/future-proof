@@ -33,6 +33,7 @@ import os, re, sys, markdown2, subprocess, datetime, shutil
 import html, secrets
 import sqlite3, hashlib
 import io
+import random
 import threading
 import uuid
 from pathlib import Path
@@ -67,6 +68,7 @@ config = setup()
 app = FastAPI(title="Note & Data Hub")
 YOUTUBE_IMPORT_JOBS = {}
 YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
+GAME_TYPES = ("tetris", "frogger", "word_guess", "hangman")
 
 # --- 2. CORE LOGIC ---
 def parse_note(f: Path):
@@ -561,6 +563,16 @@ def init_auth_db():
             FOREIGN KEY(actor_user_id) REFERENCES users(id)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS game_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            game_name TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    ''')
     msg_cols = [row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
     user_cols = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
     if "public_name" not in user_cols:
@@ -670,6 +682,45 @@ def get_unread_notification_count(user_id: int) -> int:
     ).fetchone()
     conn.close()
     return row["c"] if row else 0
+
+def submit_game_score(user_id: int, game_name: str, score: int):
+    """Persist a user's score for a supported mini game."""
+    if game_name not in GAME_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported game")
+    safe_score = max(0, min(int(score), 1_000_000))
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO game_scores (user_id, game_name, score, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, game_name, safe_score, datetime.datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+def get_game_leaderboard(game_name: str, limit: int = 10):
+    """Return top scores for one game with username/display metadata."""
+    if game_name not in GAME_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported game")
+    conn = get_db_connection()
+    rows = conn.execute(
+        """
+        SELECT game_scores.score, game_scores.created_at, users.username, users.public_name
+        FROM game_scores
+        JOIN users ON users.id = game_scores.user_id
+        WHERE game_scores.game_name = ?
+        ORDER BY game_scores.score DESC, game_scores.id ASC
+        LIMIT ?
+        """,
+        (game_name, max(1, min(limit, 50))),
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_leaderboard_snapshot(limit_each: int = 5):
+    """Return top scores grouped by game for multi-game leaderboard views."""
+    snapshot = {}
+    for game_name in GAME_TYPES:
+        snapshot[game_name] = get_game_leaderboard(game_name, limit_each)
+    return snapshot
 
 def upsert_file_record(file_type: str, filename: str, owner_user_id: Optional[int], is_public: bool):
     """Insert or update ownership/visibility metadata for a stored file."""
@@ -2312,6 +2363,7 @@ def web_home(
             <a href='#data' class='btn btn-secondary'>Data</a>
             <a href='#videos' class='btn btn-secondary'>Videos</a>
             <a href='#social' class='btn btn-secondary'>Social</a>
+            <a href='#games' class='btn btn-secondary'>Games</a>
         </div>
     </div>
     """
@@ -2514,6 +2566,21 @@ def web_home(
     else:
         recommendations_html = "<div class='card' id='recommendations'><h2>✨ From People You Follow</h2><p>Sign in and follow users to get personalized recommendations.</p></div>"
 
+    games_html = """
+    <div class='card' id='games'>
+        <h2>🎮 Mini Games</h2>
+        <div class='nav-pills'>
+            <a href='/games/tetris' class='btn btn-primary'>Tetris Style</a>
+            <a href='/games/frogger' class='btn btn-success'>Frogger Style</a>
+            <a href='/games/word-guess' class='btn btn-secondary'>Word Guess</a>
+            <a href='/games/hangman' class='btn btn-secondary'>Hangman</a>
+            <a href='/games/leaderboard' class='btn btn-secondary'>Leaderboard</a>
+            <a href='/games' class='btn btn-secondary'>Games Hub</a>
+        </div>
+        <p class='helper'>Quick break mode: play directly in your browser and return to your library anytime.</p>
+    </div>
+    """
+
     # Library Content
     notes_raw = sorted([f.name for f in config["notes"].glob("*") if f.suffix in ['.md', '.txt'] and file_visible_to_user("note", f.name, user)])
     datasets_raw = sorted([f.name for f in config["datasets"].glob("*") if f.suffix in ['.csv', '.json'] and file_visible_to_user("dataset", f.name, user)])
@@ -2671,7 +2738,7 @@ def web_home(
             </div>
         </div>"""
 
-    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
+    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}{games_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
     (function() {{
         // Lightweight polling client for async YouTube imports.
         const progressWrap = document.getElementById('ytProgressWrap');
@@ -3159,6 +3226,428 @@ def video_thumbnail(request: Request, filename: str):
         return FileResponse(thumb)
     fallback_svg = """<svg xmlns='http://www.w3.org/2000/svg' width='640' height='360'><rect width='100%' height='100%' fill='#f0f0f0'/><circle cx='320' cy='180' r='48' fill='#d9d9d9'/><polygon points='305,155 305,205 350,180' fill='#9e9e9e'/><text x='50%' y='300' text-anchor='middle' fill='#7a7a7a' font-family='Arial' font-size='22'>No thumbnail available</text></svg>"""
     return Response(content=fallback_svg, media_type="image/svg+xml")
+
+@app.get("/games", response_class=HTMLResponse)
+def games_hub_page(request: Request):
+    """Render mini games launcher page."""
+    page = """
+    <html><head>""" + COMMON_STYLE + """</head><body>
+    <a href='/'>← Back</a>
+    <h1>🎮 Mini Games</h1>
+    <div class='card'>
+        <div class='nav-pills'>
+            <a href='/games/tetris' class='btn btn-primary'>Tetris Style</a>
+            <a href='/games/frogger' class='btn btn-success'>Frogger Style</a>
+            <a href='/games/word-guess' class='btn btn-secondary'>Word Guess</a>
+            <a href='/games/hangman' class='btn btn-secondary'>Hangman</a>
+            <a href='/games/leaderboard' class='btn btn-secondary'>Leaderboard</a>
+        </div>
+        <p class='helper'>Use arrow keys for arcade games. Word games are keyboard/button based.</p>
+    </div>
+    </body></html>
+    """
+    return HTMLResponse(page)
+
+@app.get("/games/leaderboard", response_class=HTMLResponse)
+def games_leaderboard_page(request: Request):
+    """Render leaderboard page visible to all users."""
+    snapshot = get_leaderboard_snapshot(limit_each=10)
+
+    def render_rows(game_name: str) -> str:
+        rows = snapshot.get(game_name, [])
+        if not rows:
+            return "<p class='helper'>No scores yet.</p>"
+        html_rows = ""
+        for idx, row in enumerate(rows, start=1):
+            player = (row["public_name"] or "").strip() or row["username"]
+            html_rows += f"<tr><td>{idx}</td><td>{h(player)}</td><td>{h(row['score'])}</td><td>{h(row['created_at'])}</td></tr>"
+        return f"<table><thead><tr><th>#</th><th>Player</th><th>Score</th><th>When</th></tr></thead><tbody>{html_rows}</tbody></table>"
+
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/games'>← Games Hub</a>
+    <h1>🏆 Leaderboard</h1>
+    <div class='card'><h3>Tetris Style</h3>{render_rows('tetris')}</div>
+    <div class='card'><h3>Frogger Style</h3>{render_rows('frogger')}</div>
+    <div class='card'><h3>Word Guess</h3>{render_rows('word_guess')}</div>
+    <div class='card'><h3>Hangman</h3>{render_rows('hangman')}</div>
+    </body></html>
+    """
+    return HTMLResponse(page)
+
+@app.get("/games/leaderboard-data/{game_name}")
+def game_leaderboard_data(game_name: str, limit: int = 10):
+    """Return JSON leaderboard rows for a specific game."""
+    rows = get_game_leaderboard(game_name, limit=limit)
+    return {
+        "game": game_name,
+        "rows": [
+            {
+                "rank": idx,
+                "player": ((row["public_name"] or "").strip() or row["username"]),
+                "score": row["score"],
+                "created_at": row["created_at"],
+            }
+            for idx, row in enumerate(rows, start=1)
+        ],
+    }
+
+@app.post("/games/score")
+def submit_game_score_route(
+    request: Request,
+    game_name: str = Form(...),
+    score: int = Form(...),
+    csrf_token: str = Form(""),
+):
+    """Submit authenticated user's game score and return latest leaderboard slice."""
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login required to submit scores")
+    submit_game_score(user["id"], game_name, score)
+    rows = get_game_leaderboard(game_name, limit=10)
+    return {
+        "ok": True,
+        "game": game_name,
+        "rows": [
+            {
+                "rank": idx,
+                "player": ((row["public_name"] or "").strip() or row["username"]),
+                "score": row["score"],
+                "created_at": row["created_at"],
+            }
+            for idx, row in enumerate(rows, start=1)
+        ],
+    }
+
+@app.get("/games/tetris", response_class=HTMLResponse)
+def tetris_style_game_page(request: Request):
+    """Render a simple Tetris-style falling blocks game."""
+    csrf_token = get_or_create_csrf_token(request)
+    signed_in = "true" if get_current_user(request) else "false"
+    page = """
+    <html><head>""" + COMMON_STYLE + """</head><body>
+    <a href='/games'>← Games Hub</a>
+    <h1>🧩 Tetris Style</h1>
+    <div class='card'>
+        <p class='helper'>Controls: ← → move, ↑ rotate, ↓ drop faster, Space hard drop.</p>
+        <canvas id='tetris' width='300' height='600' style='border:1px solid #ccc;background:#111;max-width:100%;'></canvas>
+        <p id='tetrisStatus' class='helper'>Score: 0</p>
+        <div id='tetrisBoard'></div>
+    </div>
+    <script>
+    const csrfToken = '""" + h(csrf_token) + """';
+    const signedIn = """ + signed_in + """;
+    const canvas = document.getElementById('tetris');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('tetrisStatus');
+    const boardEl = document.getElementById('tetrisBoard');
+    const cols = 10, rows = 20, size = 30;
+    const grid = Array.from({length: rows}, () => Array(cols).fill(0));
+    const colors = ['#000', '#39f', '#f63', '#fd3', '#3d6', '#d6f'];
+    const shapes = [
+      [[1,1,1,1]], [[2,0],[2,0],[2,2]], [[0,3],[0,3],[3,3]], [[4,4],[4,4]], [[0,5,5],[5,5,0]]
+    ];
+    let score = 0, piece = null, over = false, submitted = false;
+
+    async function refreshLeaderboard(){
+      const r = await fetch('/games/leaderboard-data/tetris');
+      const d = await r.json();
+      const rows = d.rows || [];
+      boardEl.innerHTML = rows.length ? ('<h4>Leaderboard</h4><table><thead><tr><th>#</th><th>Player</th><th>Score</th></tr></thead><tbody>' + rows.map(x => '<tr><td>'+x.rank+'</td><td>'+x.player+'</td><td>'+x.score+'</td></tr>').join('') + '</tbody></table>') : '<p class="helper">No leaderboard scores yet.</p>';
+    }
+    async function submitScore(){
+      if (!signedIn || submitted) return;
+      submitted = true;
+      const form = new URLSearchParams();
+      form.set('csrf_token', csrfToken); form.set('game_name', 'tetris'); form.set('score', String(score));
+      await fetch('/games/score', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString()});
+      refreshLeaderboard();
+    }
+    function cloneShape(shape){ return shape.map(r => r.slice()); }
+    function spawn(){ const shape = cloneShape(shapes[Math.floor(Math.random()*shapes.length)]); piece = {shape, x: Math.floor((cols-shape[0].length)/2), y: 0}; if (collides(piece.x,piece.y,piece.shape)) over = true; }
+    function rotate(shape){ return shape[0].map((_, i) => shape.map(row => row[i]).reverse()); }
+    function collides(nx, ny, shape){ for (let y=0; y<shape.length; y++) for (let x=0; x<shape[y].length; x++) { if (!shape[y][x]) continue; const gx = nx + x, gy = ny + y; if (gx < 0 || gx >= cols || gy >= rows) return true; if (gy >= 0 && grid[gy][gx]) return true; } return false; }
+    function lock(){ for (let y=0; y<piece.shape.length; y++) for (let x=0; x<piece.shape[y].length; x++) { const v = piece.shape[y][x]; if (v && piece.y+y >= 0) grid[piece.y+y][piece.x+x] = v; } clearLines(); spawn(); }
+    function clearLines(){ let lines = 0; for (let y=rows-1; y>=0; y--) { if (grid[y].every(Boolean)) { grid.splice(y,1); grid.unshift(Array(cols).fill(0)); lines++; y++; } } if (lines) score += lines * 100; }
+    function drawCell(x,y,v){ ctx.fillStyle = colors[v]; ctx.fillRect(x*size, y*size, size-1, size-1); }
+    function draw(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      for (let y=0; y<rows; y++) for (let x=0; x<cols; x++) if (grid[y][x]) drawCell(x,y,grid[y][x]);
+      if (piece) for (let y=0; y<piece.shape.length; y++) for (let x=0; x<piece.shape[y].length; x++) { const v = piece.shape[y][x]; if (v) drawCell(piece.x+x, piece.y+y, v); }
+      statusEl.textContent = over ? 'Game over. Score: ' + score + (signedIn ? '' : ' (sign in to submit)') : 'Score: ' + score;
+    }
+    function tick(){ if (over) { draw(); submitScore(); return; } if (!collides(piece.x,piece.y+1,piece.shape)) piece.y++; else lock(); draw(); }
+    document.addEventListener('keydown', (e) => {
+      if (!piece || over) return;
+      if (e.key === 'ArrowLeft' && !collides(piece.x-1,piece.y,piece.shape)) piece.x--;
+      if (e.key === 'ArrowRight' && !collides(piece.x+1,piece.y,piece.shape)) piece.x++;
+      if (e.key === 'ArrowDown' && !collides(piece.x,piece.y+1,piece.shape)) piece.y++;
+      if (e.key === 'ArrowUp') { const r = rotate(piece.shape); if (!collides(piece.x,piece.y,r)) piece.shape = r; }
+      if (e.code === 'Space') { while (!collides(piece.x,piece.y+1,piece.shape)) piece.y++; lock(); }
+      draw();
+    });
+    spawn(); draw(); refreshLeaderboard(); setInterval(tick, 450);
+    </script>
+    </body></html>
+    """
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.get("/games/frogger", response_class=HTMLResponse)
+def frogger_style_game_page(request: Request):
+        """Render a simple Frogger-style crossing game."""
+        csrf_token = get_or_create_csrf_token(request)
+        signed_in = "true" if get_current_user(request) else "false"
+        page = """
+        <html><head>""" + COMMON_STYLE + """</head><body>
+        <a href='/games'>← Games Hub</a>
+        <h1>🐸 Frogger Style</h1>
+        <div class='card'>
+                <p class='helper'>Controls: Arrow keys to move. 60-second round, avoid cars and reach the top.</p>
+                <canvas id='frogger' width='520' height='520' style='border:1px solid #ccc;background:#0d1a0d;max-width:100%;'></canvas>
+                <p id='froggerStatus' class='helper'>Wins: 0 | Time: 60</p>
+                <div id='froggerBoard'></div>
+        </div>
+        <script>
+        const csrfToken = '""" + h(csrf_token) + """';
+        const signedIn = """ + signed_in + """;
+        const canvas = document.getElementById('frogger');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('froggerStatus');
+        const boardEl = document.getElementById('froggerBoard');
+        const laneH = 52;
+        let wins = 0, timeLeft = 60, gameOver = false, submitted = false;
+        const frog = {x: 260, y: 494, size: 18};
+        const cars = [];
+        const lanes = [1,2,3,4,5,6,7,8].map(i => ({y: i*laneH, speed: (i%2===0 ? 1 : -1) * (1.5 + (i%3)), count: 3}));
+        lanes.forEach((lane, idx) => { for (let i=0; i<lane.count; i++) cars.push({x: 70 + i*180 + idx*11, y: lane.y + 10, w: 72, h: 30, speed: lane.speed}); });
+        async function refreshLeaderboard(){
+            const r = await fetch('/games/leaderboard-data/frogger');
+            const d = await r.json();
+            const rows = d.rows || [];
+            boardEl.innerHTML = rows.length ? ('<h4>Leaderboard</h4><table><thead><tr><th>#</th><th>Player</th><th>Score</th></tr></thead><tbody>' + rows.map(x => '<tr><td>'+x.rank+'</td><td>'+x.player+'</td><td>'+x.score+'</td></tr>').join('') + '</tbody></table>') : '<p class="helper">No leaderboard scores yet.</p>';
+        }
+        async function submitScore(){
+            if (!signedIn || submitted) return;
+            submitted = true;
+            const finalScore = wins * 100;
+            const form = new URLSearchParams();
+            form.set('csrf_token', csrfToken); form.set('game_name', 'frogger'); form.set('score', String(finalScore));
+            await fetch('/games/score', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString()});
+            refreshLeaderboard();
+        }
+        function resetFrog(){ frog.x = 260; frog.y = 494; }
+        function hit(a,b){ return a.x < b.x+b.w && a.x+a.size > b.x && a.y < b.y+b.h && a.y+a.size > b.y; }
+        function update(){
+            if (gameOver) return;
+            for (const c of cars) {
+                c.x += c.speed;
+                if (c.speed > 0 && c.x > 560) c.x = -90;
+                if (c.speed < 0 && c.x < -100) c.x = 560;
+                if (hit(frog, c)) resetFrog();
+            }
+            if (frog.y <= 8) { wins++; resetFrog(); }
+            statusEl.textContent = 'Wins: ' + wins + ' | Time: ' + timeLeft + (gameOver ? (signedIn ? ' | Round over' : ' | Round over (sign in to submit)') : '');
+        }
+        function draw(){
+            ctx.clearRect(0,0,520,520);
+            for (let y=0; y<10; y++) { ctx.fillStyle = (y===0 || y===9) ? '#153a15' : '#2f2f2f'; ctx.fillRect(0,y*laneH,520,laneH-2); }
+            for (const c of cars) { ctx.fillStyle = '#e25555'; ctx.fillRect(c.x,c.y,c.w,c.h); }
+            ctx.fillStyle = '#6aff6a'; ctx.fillRect(frog.x,frog.y,frog.size,frog.size);
+        }
+        document.addEventListener('keydown', (e) => {
+            if (gameOver) return;
+            const step = laneH;
+            if (e.key === 'ArrowLeft') frog.x = Math.max(0, frog.x-step);
+            if (e.key === 'ArrowRight') frog.x = Math.min(520-frog.size, frog.x+step);
+            if (e.key === 'ArrowUp') frog.y = Math.max(0, frog.y-step);
+            if (e.key === 'ArrowDown') frog.y = Math.min(520-frog.size, frog.y+step);
+        });
+        setInterval(() => { if (gameOver) return; timeLeft--; if (timeLeft <= 0) { timeLeft = 0; gameOver = true; submitScore(); } }, 1000);
+        function loop(){ update(); draw(); requestAnimationFrame(loop); }
+        refreshLeaderboard();
+        loop();
+        </script>
+        </body></html>
+        """
+        response = HTMLResponse(page)
+        response.set_cookie("csrf_token", csrf_token, samesite="lax")
+        return response
+
+@app.get("/games/word-guess", response_class=HTMLResponse)
+def word_guess_game_page(request: Request):
+        """Render a browser word guess game."""
+        csrf_token = get_or_create_csrf_token(request)
+        signed_in = "true" if get_current_user(request) else "false"
+        words = ["library", "profile", "dataset", "notebook", "python", "message", "future", "upload"]
+        secret = random.choice(words)
+        page = """
+        <html><head>""" + COMMON_STYLE + """</head><body>
+        <a href='/games'>← Games Hub</a>
+        <h1>🔤 Word Guess</h1>
+        <div class='card'>
+                <p class='helper'>Guess letters to reveal the word. 8 wrong guesses allowed.</p>
+                <p id='wgWord' style='font-size:1.6em;letter-spacing:6px;'></p>
+                <p id='wgMeta' class='helper'></p>
+                <form id='wgForm' style='flex-wrap:wrap;'>
+                        <input id='wgInput' maxlength='1' placeholder='letter' required style='width:90px;'>
+                        <button class='btn btn-primary' type='submit'>Guess</button>
+                        <button class='btn btn-secondary' type='button' id='wgReset'>Reset</button>
+                </form>
+                <div id='wgBoard'></div>
+        </div>
+        <script>
+        const csrfToken = '""" + h(csrf_token) + """';
+        const signedIn = """ + signed_in + """;
+        const words = ['library','profile','dataset','notebook','python','message','future','upload'];
+        let secret = '""" + secret + """';
+        let guessed = new Set(), wrong = 0, submitted = false;
+        const maxWrong = 8;
+        const wordEl = document.getElementById('wgWord');
+        const metaEl = document.getElementById('wgMeta');
+        const input = document.getElementById('wgInput');
+        const boardEl = document.getElementById('wgBoard');
+        function masked(){ return secret.split('').map(ch => guessed.has(ch) ? ch : '_').join(' '); }
+        function won(){ return secret.split('').every(ch => guessed.has(ch)); }
+        async function refreshLeaderboard(){
+            const r = await fetch('/games/leaderboard-data/word_guess');
+            const d = await r.json();
+            const rows = d.rows || [];
+            boardEl.innerHTML = rows.length ? ('<h4>Leaderboard</h4><table><thead><tr><th>#</th><th>Player</th><th>Score</th></tr></thead><tbody>' + rows.map(x => '<tr><td>'+x.rank+'</td><td>'+x.player+'</td><td>'+x.score+'</td></tr>').join('') + '</tbody></table>') : '<p class="helper">No leaderboard scores yet.</p>';
+        }
+        async function submitScore(finalScore){
+            if (!signedIn || submitted) return;
+            submitted = true;
+            const form = new URLSearchParams();
+            form.set('csrf_token', csrfToken); form.set('game_name', 'word_guess'); form.set('score', String(finalScore));
+            await fetch('/games/score', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString()});
+            refreshLeaderboard();
+        }
+        function render(){
+            wordEl.textContent = masked();
+            metaEl.textContent = 'Wrong: ' + wrong + '/' + maxWrong + ' | Guessed: ' + (Array.from(guessed).sort().join(', ') || 'none');
+            if (won()) {
+                const finalScore = Math.max(0, (maxWrong - wrong) * 15 + secret.length * 20);
+                metaEl.textContent += ' | You win! Score: ' + finalScore + (signedIn ? '' : ' (sign in to submit)');
+                submitScore(finalScore);
+            }
+            if (wrong >= maxWrong) metaEl.textContent += ' | You lose. Word: ' + secret;
+        }
+        document.getElementById('wgForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            if (won() || wrong >= maxWrong) return;
+            const ch = (input.value || '').toLowerCase().trim();
+            input.value = '';
+            if (!/^[a-z]$/.test(ch) || guessed.has(ch)) return;
+            guessed.add(ch);
+            if (!secret.includes(ch)) wrong++;
+            render();
+        });
+        document.getElementById('wgReset').addEventListener('click', () => {
+            secret = words[Math.floor(Math.random()*words.length)];
+            guessed = new Set(); wrong = 0; submitted = false; render();
+        });
+        render(); refreshLeaderboard();
+        </script>
+        </body></html>
+        """
+        response = HTMLResponse(page)
+        response.set_cookie("csrf_token", csrf_token, samesite="lax")
+        return response
+
+@app.get("/games/hangman", response_class=HTMLResponse)
+def hangman_game_page(request: Request):
+        """Render a browser hangman game."""
+        csrf_token = get_or_create_csrf_token(request)
+        signed_in = "true" if get_current_user(request) else "false"
+        words = ["keyboard", "archive", "session", "network", "terminal", "science", "fastapi", "thumbnails"]
+        secret = random.choice(words)
+        page = """
+        <html><head>""" + COMMON_STYLE + """</head><body>
+        <a href='/games'>← Games Hub</a>
+        <h1>🪢 Hangman</h1>
+        <div class='card'>
+                <p id='hmDrawing' style='font-family:ui-monospace, SFMono-Regular, Menlo, monospace;white-space:pre;line-height:1.1;'></p>
+                <p id='hmWord' style='font-size:1.5em;letter-spacing:6px;'></p>
+                <p id='hmMeta' class='helper'></p>
+                <form id='hmForm' style='flex-wrap:wrap;'>
+                        <input id='hmInput' maxlength='1' placeholder='letter' required style='width:90px;'>
+                        <button class='btn btn-primary' type='submit'>Guess</button>
+                        <button class='btn btn-secondary' type='button' id='hmReset'>Reset</button>
+                </form>
+                <div id='hmBoard'></div>
+        </div>
+        <script>
+        const csrfToken = '""" + h(csrf_token) + """';
+        const signedIn = """ + signed_in + """;
+        const words = ['keyboard','archive','session','network','terminal','science','fastapi','thumbnails'];
+        let secret = '""" + secret + """';
+        let guessed = new Set(), wrong = 0, submitted = false;
+        const maxWrong = 6;
+        const stages = [
+`\n +---+\n |   |\n     |\n     |\n     |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n     |\n     |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n |   |\n     |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n/|   |\n     |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n/|\\  |\n     |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n/|\\  |\n/    |\n     |\n=======`,
+`\n +---+\n |   |\n O   |\n/|\\  |\n/ \\  |\n     |\n=======`
+        ];
+        const drawEl = document.getElementById('hmDrawing');
+        const wordEl = document.getElementById('hmWord');
+        const metaEl = document.getElementById('hmMeta');
+        const input = document.getElementById('hmInput');
+        const boardEl = document.getElementById('hmBoard');
+        function masked(){ return secret.split('').map(ch => guessed.has(ch) ? ch : '_').join(' '); }
+        function won(){ return secret.split('').every(ch => guessed.has(ch)); }
+        async function refreshLeaderboard(){
+            const r = await fetch('/games/leaderboard-data/hangman');
+            const d = await r.json();
+            const rows = d.rows || [];
+            boardEl.innerHTML = rows.length ? ('<h4>Leaderboard</h4><table><thead><tr><th>#</th><th>Player</th><th>Score</th></tr></thead><tbody>' + rows.map(x => '<tr><td>'+x.rank+'</td><td>'+x.player+'</td><td>'+x.score+'</td></tr>').join('') + '</tbody></table>') : '<p class="helper">No leaderboard scores yet.</p>';
+        }
+        async function submitScore(finalScore){
+            if (!signedIn || submitted) return;
+            submitted = true;
+            const form = new URLSearchParams();
+            form.set('csrf_token', csrfToken); form.set('game_name', 'hangman'); form.set('score', String(finalScore));
+            await fetch('/games/score', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString()});
+            refreshLeaderboard();
+        }
+        function render(){
+            drawEl.textContent = stages[wrong];
+            wordEl.textContent = masked();
+            metaEl.textContent = 'Wrong: ' + wrong + '/' + maxWrong + ' | Guessed: ' + (Array.from(guessed).sort().join(', ') || 'none');
+            if (won()) {
+                const finalScore = Math.max(0, (maxWrong - wrong) * 25 + secret.length * 15);
+                metaEl.textContent += ' | You win! Score: ' + finalScore + (signedIn ? '' : ' (sign in to submit)');
+                submitScore(finalScore);
+            }
+            if (wrong >= maxWrong) metaEl.textContent += ' | You lose. Word: ' + secret;
+        }
+        document.getElementById('hmForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            if (won() || wrong >= maxWrong) return;
+            const ch = (input.value || '').toLowerCase().trim();
+            input.value = '';
+            if (!/^[a-z]$/.test(ch) || guessed.has(ch)) return;
+            guessed.add(ch);
+            if (!secret.includes(ch)) wrong++;
+            render();
+        });
+        document.getElementById('hmReset').addEventListener('click', () => {
+            secret = words[Math.floor(Math.random()*words.length)];
+            guessed = new Set(); wrong = 0; submitted = false; render();
+        });
+        render(); refreshLeaderboard();
+        </script>
+        </body></html>
+        """
+        response = HTMLResponse(page)
+        response.set_cookie("csrf_token", csrf_token, samesite="lax")
+        return response
 
 if __name__ == "__main__":
     subprocess.run(["uvicorn", f"{Path(__file__).stem}:app", "--reload", "--port", "8080"])
