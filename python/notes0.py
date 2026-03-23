@@ -98,6 +98,28 @@ NEWS_SOURCES = [
 ]
 NEWS_CACHE_LOCK = threading.Lock()
 NEWS_CACHE = {"expires_at": 0.0, "items": []}
+MARKETPLACE_ITEM_TYPES = {
+    "vehicle": {
+        "label": "Vehicle",
+        "detail_labels": ["Year", "Make/Brand", "Trim/Fuel"],
+    },
+    "electronics": {
+        "label": "Electronics",
+        "detail_labels": ["Brand", "Model", "Condition"],
+    },
+    "furniture": {
+        "label": "Furniture",
+        "detail_labels": ["Material", "Style", "Condition"],
+    },
+    "clothing": {
+        "label": "Clothing",
+        "detail_labels": ["Brand", "Size", "Condition"],
+    },
+    "other": {
+        "label": "Other",
+        "detail_labels": ["Detail 1", "Detail 2", "Detail 3"],
+    },
+}
 
 # --- 2. CORE LOGIC ---
 def parse_note(f: Path):
@@ -795,6 +817,8 @@ def init_auth_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             seller_user_id INTEGER NOT NULL,
             title TEXT NOT NULL,
+            item_type TEXT NOT NULL DEFAULT 'other',
+            item_details_json TEXT NOT NULL DEFAULT '{}',
             price INTEGER NOT NULL,
             location TEXT NOT NULL,
             mileage INTEGER,
@@ -815,6 +839,10 @@ def init_auth_db():
         conn.execute("UPDATE users SET public_name = username WHERE public_name IS NULL OR trim(public_name) = ''")
     if "read_at" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+    if "item_type" not in listing_cols:
+        conn.execute("ALTER TABLE marketplace_listings ADD COLUMN item_type TEXT NOT NULL DEFAULT 'other'")
+    if "item_details_json" not in listing_cols:
+        conn.execute("ALTER TABLE marketplace_listings ADD COLUMN item_details_json TEXT NOT NULL DEFAULT '{}' ")
     if "is_sold" not in listing_cols:
         conn.execute("ALTER TABLE marketplace_listings ADD COLUMN is_sold INTEGER NOT NULL DEFAULT 0")
     if "sold_at" not in listing_cols:
@@ -977,9 +1005,39 @@ def normalize_marketplace_image_url(image_url: str) -> str:
         raise HTTPException(status_code=400, detail="Image URL must be a valid http(s) URL")
     return value
 
+def normalize_marketplace_item_type(item_type: str) -> str:
+    """Normalize/validate marketplace item type key."""
+    key = (item_type or "").strip().lower()
+    if key not in MARKETPLACE_ITEM_TYPES:
+        return "other"
+    return key
+
+def build_marketplace_item_details(item_type: str, detail_a: str, detail_b: str, detail_c: str) -> dict:
+    """Build sanitized marketplace details dictionary from generic detail fields."""
+    clean_type = normalize_marketplace_item_type(item_type)
+    labels = MARKETPLACE_ITEM_TYPES[clean_type]["detail_labels"]
+    values = [(detail_a or "").strip(), (detail_b or "").strip(), (detail_c or "").strip()]
+    details = {}
+    for label, value in zip(labels, values):
+        if value:
+            details[label] = value[:80]
+    return details
+
+def parse_marketplace_item_details(raw_json: str) -> dict:
+    """Parse item details JSON safely for template rendering."""
+    try:
+        parsed = json.loads(raw_json or "{}")
+    except Exception:
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
 def create_marketplace_listing(
     seller_user_id: int,
     title: str,
+    item_type: str,
+    detail_a: str,
+    detail_b: str,
+    detail_c: str,
     price: int,
     location: str,
     mileage: Optional[int],
@@ -991,6 +1049,8 @@ def create_marketplace_listing(
     clean_location = (location or "").strip()
     clean_description = (description or "").strip()
     clean_image_url = normalize_marketplace_image_url(image_url)
+    clean_item_type = normalize_marketplace_item_type(item_type)
+    item_details = build_marketplace_item_details(clean_item_type, detail_a, detail_b, detail_c)
 
     if len(clean_title) < 4 or len(clean_title) > 140:
         raise HTTPException(status_code=400, detail="Title must be between 4 and 140 characters")
@@ -1009,12 +1069,14 @@ def create_marketplace_listing(
     conn.execute(
         """
         INSERT INTO marketplace_listings
-            (seller_user_id, title, price, location, mileage, description, image_url, is_active, is_sold, sold_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?)
+            (seller_user_id, title, item_type, item_details_json, price, location, mileage, description, image_url, is_active, is_sold, sold_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?)
         """,
         (
             seller_user_id,
             clean_title,
+            clean_item_type,
+            json.dumps(item_details),
             safe_price,
             clean_location,
             safe_mileage,
@@ -1036,6 +1098,8 @@ def get_recent_marketplace_listings(limit: int = 40, sold_only: bool = False):
                         marketplace_listings.id,
                         marketplace_listings.seller_user_id,
                         marketplace_listings.title,
+                    marketplace_listings.item_type,
+                    marketplace_listings.item_details_json,
                         marketplace_listings.price,
                         marketplace_listings.location,
                         marketplace_listings.mileage,
@@ -2772,6 +2836,10 @@ def marketplace_page(
     user = get_current_user(request)
     error_message = ""
     web_listings = []
+    item_type_options_html = "".join(
+        [f"<option value='{h(key)}'>{h(value['label'])}</option>" for key, value in MARKETPLACE_ITEM_TYPES.items()]
+    )
+    item_type_config_json = json.dumps(MARKETPLACE_ITEM_TYPES)
     try:
         web_listings = extract_autotempest_listings(make, model, zip_code, radius, max_price)
     except Exception:
@@ -2787,6 +2855,9 @@ def marketplace_page(
             image_html = f"<img class='video-thumb' src='{h(row['image_url'])}' alt='Listing image for {h(row['title'])}'>"
         mileage_label = f"{int(row['mileage']):,} mi" if row["mileage"] is not None else ""
         meta_bits = [bit for bit in [mileage_label, row["location"], row["created_at"][:10]] if bit]
+        type_label = MARKETPLACE_ITEM_TYPES.get(row["item_type"], MARKETPLACE_ITEM_TYPES["other"])["label"]
+        details_dict = parse_marketplace_item_details(row["item_details_json"])
+        details_line = " · ".join([str(v) for v in details_dict.values() if str(v).strip()])
         meta_line = " · ".join(meta_bits)
         description = (row["description"] or "").strip()
         if len(description) > 140:
@@ -2804,11 +2875,12 @@ def marketplace_page(
             {image_html}
             <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,}</div>
             <div class='video-title'>{h(row['title'])}</div>
+            <div class='helper'><strong>{h(type_label)}</strong>{(' · ' + h(details_line)) if details_line else ''}</div>
             <div class='helper'>{h(meta_line)}</div>
             <div class='helper' style='min-height:2.3em;'>{h(description)}</div>
             <div class='video-actions'>
                 <a href='/u/{u(row['seller_username'])}' class='btn btn-secondary'>Seller: {h(seller_name)}</a>
-                <a href='/messages?recipient_username={u(row['seller_username'])}' class='btn btn-primary'>Message</a>
+                <a href='/marketplace/listings/{int(row['id'])}/message' class='btn btn-primary'>{'Message' if user else 'Sign In to Message'}</a>
                 {seller_actions}
             </div>
         </div>
@@ -2822,6 +2894,9 @@ def marketplace_page(
             image_html = f"<img class='video-thumb' src='{h(row['image_url'])}' alt='Listing image for {h(row['title'])}'>"
         sold_date = (row["sold_at"] or row["created_at"] or "")[:10]
         mileage_label = f"{int(row['mileage']):,} mi" if row["mileage"] is not None else ""
+        type_label = MARKETPLACE_ITEM_TYPES.get(row["item_type"], MARKETPLACE_ITEM_TYPES["other"])["label"]
+        details_dict = parse_marketplace_item_details(row["item_details_json"])
+        details_line = " · ".join([str(v) for v in details_dict.values() if str(v).strip()])
         meta_bits = [bit for bit in [mileage_label, row["location"], f"Sold {sold_date}" if sold_date else "Sold"] if bit]
         meta_line = " · ".join(meta_bits)
         sold_cards_html += f"""
@@ -2829,6 +2904,7 @@ def marketplace_page(
             {image_html}
             <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,} <span class='helper' style='font-weight:600;'>(SOLD)</span></div>
             <div class='video-title'>{h(row['title'])}</div>
+            <div class='helper'><strong>{h(type_label)}</strong>{(' · ' + h(details_line)) if details_line else ''}</div>
             <div class='helper'>{h(meta_line)}</div>
             <div class='video-actions'>
                 <a href='/u/{u(row['seller_username'])}' class='btn btn-secondary'>Seller: {h(seller_name)}</a>
@@ -2882,6 +2958,12 @@ def marketplace_page(
             <form action='/marketplace/listings/create' method='post' style='display:flex;gap:8px;flex-wrap:wrap;'>
                 <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
                 <input type='text' name='title' placeholder='Listing title (e.g., 2021 Camry SE)' style='flex:2;min-width:220px;' required>
+                <select name='item_type' id='mpItemType' style='min-width:180px;padding:10px;border:1px solid #ddd;border-radius:4px;'>
+                    {item_type_options_html}
+                </select>
+                <input type='text' id='mpDetailA' name='detail_a' placeholder='Detail 1' style='min-width:160px;'>
+                <input type='text' id='mpDetailB' name='detail_b' placeholder='Detail 2' style='min-width:160px;'>
+                <input type='text' id='mpDetailC' name='detail_c' placeholder='Detail 3' style='min-width:160px;'>
                 <input type='number' name='price' min='100' max='5000000' step='100' placeholder='Price' style='width:130px;' required>
                 <input type='text' name='location' placeholder='City, ST' style='width:180px;' required>
                 <input type='number' name='mileage' min='0' max='2000000' step='100' placeholder='Mileage' style='width:120px;'>
@@ -2932,6 +3014,27 @@ def marketplace_page(
     <div class='video-grid'>
         {web_cards_html}
     </div>
+    <script>
+    (function() {{
+        const itemTypeSelect = document.getElementById('mpItemType');
+        const detailA = document.getElementById('mpDetailA');
+        const detailB = document.getElementById('mpDetailB');
+        const detailC = document.getElementById('mpDetailC');
+        const config = {item_type_config_json};
+        function updateDetailPlaceholders() {{
+            if (!itemTypeSelect || !detailA || !detailB || !detailC) return;
+            const key = itemTypeSelect.value || 'other';
+            const labels = (config[key] && config[key].detail_labels) ? config[key].detail_labels : ['Detail 1','Detail 2','Detail 3'];
+            detailA.placeholder = labels[0] || 'Detail 1';
+            detailB.placeholder = labels[1] || 'Detail 2';
+            detailC.placeholder = labels[2] || 'Detail 3';
+        }}
+        if (itemTypeSelect) {{
+            itemTypeSelect.addEventListener('change', updateDetailPlaceholders);
+            updateDetailPlaceholders();
+        }}
+    }})();
+    </script>
     </body></html>
     """
 
@@ -2944,6 +3047,10 @@ def marketplace_create_listing_route(
     request: Request,
     csrf_token: str = Form(""),
     title: str = Form(...),
+    item_type: str = Form("other"),
+    detail_a: str = Form(""),
+    detail_b: str = Form(""),
+    detail_c: str = Form(""),
     price: int = Form(...),
     location: str = Form(...),
     mileage: Optional[int] = Form(None),
@@ -2959,6 +3066,10 @@ def marketplace_create_listing_route(
         create_marketplace_listing(
             seller_user_id=user["id"],
             title=title,
+            item_type=item_type,
+            detail_a=detail_a,
+            detail_b=detail_b,
+            detail_c=detail_c,
             price=price,
             location=location,
             mileage=mileage,
