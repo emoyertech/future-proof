@@ -69,6 +69,7 @@ def setup():
 
 config = setup()
 app = FastAPI(title="Note & Data Hub")
+CLOUDFLARE_SWITCH_URL = (os.getenv("FP_CLOUDFLARE_URL") or "").strip()
 YOUTUBE_IMPORT_JOBS = {}
 YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
 GAME_TYPES = ("tetris", "frogger", "word_guess", "hangman")
@@ -81,6 +82,7 @@ HOME_PANEL_IDS = [
     "videos",
     "setup",
     "recommendations",
+    "marketplace-mini",
     "news",
     "games",
     "chat",
@@ -538,19 +540,24 @@ def autotempest_is_listing_link(link: str) -> bool:
     host = (parsed.netloc or "").lower()
     if not host:
         return False
-    if host.endswith("autotempest.com"):
-        return False
+
     path = (parsed.path or "").lower()
     query = (parsed.query or "").lower()
+    haystack = f"{path}?{query}"
+
     listing_signatures = (
         "/vehicle/",
         "/vehicledetail/",
         "/itm/",
         "/details/cars/",
+        "/external-source/",
         "request=adlink",
         "ad=",
     )
-    haystack = f"{path}?{query}"
+
+    if host.endswith("autotempest.com"):
+        return any(sig in haystack for sig in listing_signatures)
+
     return any(sig in haystack for sig in listing_signatures)
 
 def normalize_space(value: str) -> str:
@@ -585,8 +592,14 @@ def extract_autotempest_listings(
         params["maxprice"] = str(clean_max_price)
 
     source_url = f"https://www.autotempest.com/results?{urlencode(params)}"
-    req = UrlRequest(source_url, headers={"User-Agent": "future-proof-notes/1.0"})
-    with urlopen(req, timeout=10) as response:
+    req = UrlRequest(
+        source_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    with urlopen(req, timeout=20) as response:
         page_html = response.read().decode("utf-8", errors="replace")
 
     listings = []
@@ -603,25 +616,33 @@ def extract_autotempest_listings(
             continue
 
         parsed = urlparse(href)
-        dedupe_key = f"{parsed.netloc.lower()}|{parsed.path}"
+        host_label = (parsed.netloc or "listing").lower().replace("www.", "")
+        source_label = host_label
+        if host_label.endswith("autotempest.com") and parsed.path.startswith("/external-source/"):
+            external_bits = [part for part in parsed.path.split("/") if part]
+            if len(external_bits) >= 2:
+                source_label = external_bits[1].lower()
+
+        dedupe_key = f"{host_label}|{parsed.path}|{parsed.query}"
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
 
         raw_title = re.sub(r"<[^>]+>", " ", match.group(2) or "")
         title = normalize_space(html.unescape(raw_title))
-        if len(title) < 6:
-            continue
 
         nearby = page_html[max(0, match.start() - 320): min(len(page_html), match.end() + 520)]
         nearby_clean = normalize_space(re.sub(r"<[^>]+>", " ", nearby))
+
+        if len(title) < 6:
+            provider = source_label.split(".")[0].replace("-", " ").title()
+            title = f"{provider} results for {clean_make.title()} {clean_model.title()}"
 
         price_match = re.search(r"\$\s?[\d,]{2,}", nearby_clean)
         miles_match = re.search(r"\b([\d,]{1,7})\s*mi\.?\b", nearby_clean, re.IGNORECASE)
         location_match = re.search(r"\b([A-Za-z][A-Za-z .'-]+,\s?[A-Z]{2})\b", nearby_clean)
         image_match = re.search(r"<img[^>]+src=[\"']([^\"']+)[\"']", nearby, re.IGNORECASE)
 
-        source_label = (parsed.netloc or "listing").lower().replace("www.", "")
         image_url = html.unescape(image_match.group(1)).strip() if image_match else ""
         if image_url.startswith("/"):
             image_url = f"https://www.autotempest.com{image_url}"
@@ -631,7 +652,7 @@ def extract_autotempest_listings(
                 "title": title,
                 "link": href,
                 "source": source_label,
-                "price": price_match.group(0).replace(" ", "") if price_match else "Price not shown",
+                "price": price_match.group(0).replace(" ", "") if price_match else "See source",
                 "miles": f"{miles_match.group(1)} mi" if miles_match else "",
                 "location": location_match.group(1) if location_match else "",
                 "image": image_url,
@@ -1496,15 +1517,15 @@ def generate_video_thumbnail(video_name: str) -> Optional[Path]:
 # --- 3. UI STYLES ---
 COMMON_STYLE = """
 <style>
-    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px; line-height: 1.45; background: #f8f9fa; color: #333; transition: background .2s ease, color .2s ease; }
-    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease; }
-    body.theme-dark { background: #121212; color: #e8e8e8; }
-    body.theme-dark .card { background: #1f1f1f; color: #e8e8e8; box-shadow: 0 2px 4px rgba(0,0,0,0.45); }
-    body.theme-dark a { color: #9ecbff; }
-    body.theme-dark .helper, body.theme-dark .chat-meta, body.theme-dark .social-username { color: #b7b7b7; }
-    body.theme-dark .note-item, body.theme-dark .social-user, body.theme-dark th, body.theme-dark td { border-color: #343434; }
-    body.theme-dark th { background: #2a2a2a; color: #ddd; }
-    body.theme-dark .preview-box, body.theme-dark .social-col, body.theme-dark input[type="text"], body.theme-dark input[type="password"], body.theme-dark input[type="file"], body.theme-dark textarea, body.theme-dark select { background: #181818; color: #eee; border-color: #3c3c3c; }
+    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px 20px 140px; line-height: 1.45; background: #e3ece5; color: #22332a; transition: background .2s ease, color .2s ease; }
+    .card { background: #f1f7f2; padding: 20px; border-radius: 10px; border: 1px solid #c2d3c7; box-shadow: 0 2px 6px rgba(20, 48, 33, 0.10); margin-bottom: 20px; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease; }
+    body.theme-dark { background: #0f1a14; color: #dce9df; }
+    body.theme-dark .card { background: #182820; color: #dce9df; box-shadow: 0 2px 6px rgba(0,0,0,0.45); border-color: #2e493b; }
+    body.theme-dark a { color: #9fd8b4; }
+    body.theme-dark .helper, body.theme-dark .chat-meta, body.theme-dark .social-username { color: #adc2b5; }
+    body.theme-dark .note-item, body.theme-dark .social-user, body.theme-dark th, body.theme-dark td { border-color: #355243; }
+    body.theme-dark th { background: #22362c; color: #d3e2d8; }
+    body.theme-dark .preview-box, body.theme-dark .social-col, body.theme-dark input[type="text"], body.theme-dark input[type="password"], body.theme-dark input[type="file"], body.theme-dark textarea, body.theme-dark select { background: #132118; color: #e4efe8; border-color: #3a5a49; }
     body.layout-wide { max-width: 1250px; }
     body.layout-focus .home-grid { grid-template-columns: 1fr; }
     body.layout-compact { font-size: 0.95em; }
@@ -1516,7 +1537,7 @@ COMMON_STYLE = """
     body.layout-custom .card { padding: var(--fp-custom-card-pad, 20px); }
     body.layout-custom .home-grid { grid-template-columns: var(--fp-custom-home-cols, 2fr 1fr); }
     .nav-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
-    .helper { color: #666; font-size: 0.85em; margin-top: 6px; }
+    .helper { color: #4f6558; font-size: 0.85em; margin-top: 6px; }
     .notice-ok { color:#155724; background:#d4edda; padding:8px; border-radius:4px; }
     .notice-bad { color:#721c24; background:#f8d7da; padding:8px; border-radius:4px; }
     .progress-wrap { margin-top: 10px; }
@@ -1524,23 +1545,55 @@ COMMON_STYLE = """
     .progress-value { width: 100%; height: 14px; }
     .display-controls { display:flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .display-controls select { min-width: 160px; padding: 8px; border-radius: 4px; border: 1px solid #ddd; }
-    .global-display-toolbar { position: sticky; top: 8px; z-index: 50; background: rgba(255,255,255,0.92); border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin: 0 0 12px auto; width: fit-content; backdrop-filter: blur(4px); }
+    .global-display-toolbar {
+        position: fixed;
+        bottom: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 120;
+        background: rgba(233, 242, 236, 0.97);
+        border: 1px solid #afc3b5;
+        border-radius: 12px;
+        padding: 10px 12px;
+        width: min(980px, calc(100vw - 20px));
+        box-sizing: border-box;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 10px 24px rgba(20,48,33,0.20);
+    }
     .global-display-toolbar .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .global-display-toolbar select { padding: 6px 8px; border-radius: 4px; border: 1px solid #ddd; }
-    .global-display-toolbar button { padding: 6px 10px; border: 0; border-radius: 4px; background: #6c757d; color: #fff; cursor: pointer; }
+    .global-display-toolbar select { padding: 6px 8px; border-radius: 4px; border: 1px solid #b6c9ba; background: #f3f8f4; color: #22332a; }
+    .global-display-toolbar button { padding: 6px 10px; border: 0; border-radius: 4px; background: #356e50; color: #fff; cursor: pointer; }
     .global-display-toolbar .custom-row { display: none; margin-top: 8px; gap: 10px; align-items: center; flex-wrap: wrap; }
     .global-display-toolbar .custom-row label { font-size: 0.78em; display: flex; gap: 6px; align-items: center; }
     .global-display-toolbar .custom-row input[type="range"] { width: 120px; }
     .global-display-toolbar .custom-val { font-size: 0.78em; min-width: 42px; display: inline-block; text-align: right; }
     .global-display-toolbar .preset-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .global-display-toolbar .preset-row input { padding: 6px 8px; border-radius: 4px; border: 1px solid #ddd; }
-    body.theme-dark .global-display-toolbar { background: rgba(25,25,25,0.92); border-color: #3c3c3c; }
-    body.theme-dark .global-display-toolbar select { background: #181818; color: #eee; border-color: #3c3c3c; }
+    .global-display-toolbar .preset-row input { padding: 6px 8px; border-radius: 4px; border: 1px solid #b6c9ba; background: #f3f8f4; color: #22332a; }
+    .global-display-toolbar .cloudflare-row { margin-top: 8px; display: flex; justify-content: flex-end; }
+    .global-display-toolbar .cloudflare-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid #a9c0b0;
+        background: #e7f2ea;
+        color: #234232;
+        text-decoration: none;
+        font-size: 0.8em;
+        font-weight: 600;
+    }
+    .global-display-toolbar .cloudflare-link:hover { background: #d7e8dc; }
+    body.theme-dark .global-display-toolbar { background: rgba(19,34,27,0.94); border-color: #3b5a4a; }
+    body.theme-dark .global-display-toolbar select,
+    body.theme-dark .global-display-toolbar .preset-row input { background: #132118; color: #e4efe8; border-color: #3c5f4c; }
+    body.theme-dark .global-display-toolbar .cloudflare-link { background: #1c3328; color: #c7e6d3; border-color: #3d5f4d; }
+    body.theme-dark .global-display-toolbar .cloudflare-link:hover { background: #244135; }
     .btn { padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; cursor: pointer; border: none; display: inline-block; font-size: 0.9em; }
-    .btn-primary { background: #007bff; color: white; }
-    .btn-success { background: #28a745; color: white; }
+    .btn-primary { background: #2f7a4f; color: white; }
+    .btn-success { background: #3a8f5f; color: white; }
     .btn-danger { background: #dc3545; color: white; }
-    .btn-secondary { background: #6c757d; color: white; }
+    .btn-secondary { background: #4d6758; color: white; }
     .home-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: start; }
     .home-grid > .stack { min-width: 0; }
     .stack { display: flex; flex-direction: column; gap: 12px; }
@@ -1556,15 +1609,15 @@ COMMON_STYLE = """
     .dashboard-panel { position: relative; }
     .panel-toggle-btn {
         padding: 4px 8px;
-        border: 1px solid #d9d9d9;
+        border: 1px solid #b7cabc;
         border-radius: 999px;
-        background: #fff;
-        color: #555;
+        background: #edf4ef;
+        color: #355346;
         font-size: 0.74em;
         cursor: pointer;
         margin-left: 8px;
     }
-    .panel-toggle-btn:hover { background: #f3f3f3; }
+    .panel-toggle-btn:hover { background: #e3eee7; }
     .panel-header-anchor {
         display: flex;
         align-items: center;
@@ -1573,28 +1626,60 @@ COMMON_STYLE = """
         min-height: 28px;
     }
     .panel-collapsed .panel-body { display: none; }
-    .panel-collapsed { border: 1px solid #e8e8e8; }
-    body.theme-dark .panel-toggle-btn { background: #232323; color: #ddd; border-color: #3b3b3b; }
-    body.theme-dark .panel-toggle-btn:hover { background: #2c2c2c; }
-    body.theme-dark .panel-collapsed { border-color: #3a3a3a; }
+    .panel-collapsed { border: 1px solid #cad9cf; }
+    body.theme-dark .panel-toggle-btn { background: #1d2f25; color: #d3e1d8; border-color: #3c5a4a; }
+    body.theme-dark .panel-toggle-btn:hover { background: #23392d; }
+    body.theme-dark .panel-collapsed { border-color: #385444; }
     .chat-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
-    .chat-item { border: 1px solid #eee; border-radius: 6px; padding: 10px; background: #fafafa; }
-    .chat-meta { color: #666; font-size: 0.75em; margin-bottom: 4px; }
+    .chat-item { border: 1px solid #c8d8ce; border-radius: 6px; padding: 10px; background: #eaf2ec; }
+    .chat-meta { color: #4f6558; font-size: 0.75em; margin-bottom: 4px; }
     .social-stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
-    .stat-pill { background: #f4f6f8; border: 1px solid #e4e7eb; border-radius: 999px; padding: 8px 12px; font-size: 0.85em; }
+    .stat-pill { background: #e6f0e9; border: 1px solid #c6d7cb; border-radius: 999px; padding: 8px 12px; font-size: 0.85em; }
     .social-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .social-col { border: 1px solid #eee; border-radius: 8px; padding: 8px 12px; background: #fff; }
-    .social-title { margin: 6px 0 8px; font-size: 0.9em; color: #444; }
-    .social-user { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f1f1; }
+    .social-col { border: 1px solid #cad9cf; border-radius: 8px; padding: 8px 12px; background: #edf4ef; }
+    .social-title { margin: 6px 0 8px; font-size: 0.9em; color: #355346; }
+    .social-user { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #d8e5dc; }
     .social-user:last-child { border-bottom: none; }
-    .social-username { color: #666; font-size: 0.82em; }
-    .note-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .social-username { color: #4f6558; font-size: 0.82em; }
+    .note-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #d6e2d9; }
     .badge-lock { font-size: 0.72em; color: #fff; background: #6c757d; border-radius: 10px; padding: 2px 8px; margin-left: 8px; }
-    .preview-box { overflow-x: auto; max-height: 150px; border: 1px solid #eee; border-radius: 4px; margin-top: 10px; }
+    .preview-box { overflow-x: auto; max-height: 150px; border: 1px solid #cad9cf; border-radius: 4px; margin-top: 10px; }
     .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
-    .video-card { border: 1px solid #eee; border-radius: 8px; background: #fff; padding: 10px; }
-    .video-thumb { width: 100%; height: 130px; object-fit: cover; border-radius: 6px; background: #f0f0f0; border: 1px solid #ddd; }
+    .video-card { border: 1px solid #cad9cf; border-radius: 8px; background: #eef4f0; padding: 10px; }
+    .video-thumb { width: 100%; height: 130px; object-fit: cover; border-radius: 6px; background: #dde8e0; border: 1px solid #c2d2c7; }
     .video-title { font-size: 0.85em; margin: 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mp-title { white-space: normal; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; min-height: 2.5em; }
+    .marketplace-hero { border: 1px solid #bfd1c5; background: linear-gradient(180deg, #eef6f0 0%, #dfece4 100%); }
+    .marketplace-section-card { border: 1px solid #cad9cf; }
+    .market-mini-list .note-item { padding: 8px 0; }
+    .market-mini-title { font-size: 0.9em; font-weight: 600; }
+    .market-mini-meta { font-size: 0.78em; color: #4f6558; }
+    .at-loading-card { position: relative; overflow: hidden; }
+    .at-loading-card .video-thumb { background: #dbe8df; border-color: #c8d8ce; }
+    .at-skel-line { height: 10px; border-radius: 999px; background: #d4e2d8; margin-top: 8px; }
+    .at-skel-line.w40 { width: 40%; }
+    .at-skel-line.w60 { width: 60%; }
+    .at-skel-line.w80 { width: 80%; }
+    .at-loading-card::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: -150%;
+        width: 120%;
+        height: 100%;
+        background: linear-gradient(90deg, rgba(240,250,243,0) 0%, rgba(240,250,243,0.50) 50%, rgba(240,250,243,0) 100%);
+        animation: atShimmer 1.15s ease-in-out infinite;
+        pointer-events: none;
+    }
+    @keyframes atShimmer {
+        0% { left: -150%; }
+        100% { left: 140%; }
+    }
+    body.theme-dark .marketplace-hero { border-color: #3b5a49; background: linear-gradient(180deg, #1a2b22 0%, #14231c 100%); }
+    body.theme-dark .marketplace-section-card { border-color: #365242; }
+    body.theme-dark .market-mini-meta { color: #adc2b5; }
+    body.theme-dark .at-loading-card .video-thumb { background: #1f3329; border-color: #355343; }
+    body.theme-dark .at-skel-line { background: #2d4638; }
     .video-actions { display: flex; align-items: center; justify-content: flex-start; gap: 14px; margin-top: 10px; }
     .video-actions form { display: flex; margin: 0; }
     .video-actions .btn,
@@ -1627,15 +1712,22 @@ COMMON_STYLE = """
         .video-actions .btn, .video-actions button.btn { width: 100%; min-width: 0; }
         .player-controls .inline-form { margin-left: 0; }
         .player-controls .btn, .player-controls .inline-form button { width: 100%; }
+        .global-display-toolbar {
+            bottom: 8px;
+            width: calc(100vw - 12px);
+            max-height: 42vh;
+            overflow-y: auto;
+            padding: 8px;
+        }
     }
     @media (max-width: 980px) {
         .home-grid { grid-template-columns: 1fr; }
         .home-col-secondary-sticky { position: static; }
     }
     table { width: 100%; border-collapse: collapse; font-size: 0.75em; }
-    th, td { border: 1px solid #eee; padding: 6px; text-align: left; white-space: nowrap; }
-    th { background: #f9f9f9; color: #666; }
-    input[type="text"], input[type="password"], input[type="file"], textarea { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+    th, td { border: 1px solid #d0ddd4; padding: 6px; text-align: left; white-space: nowrap; }
+    th { background: #eaf2ec; color: #355346; }
+    input[type="text"], input[type="password"], input[type="file"], textarea { padding: 10px; border: 1px solid #bfd1c5; border-radius: 4px; background: #f4f9f5; color: #22332a; }
     form { display: flex; gap: 10px; align-items: center; }
 </style>
 <script>
@@ -1745,8 +1837,11 @@ COMMON_STYLE = """
                     <button id='globalPresetSaveBtn' type='button'>Save Preset</button>
                     <button id='globalPresetDeleteBtn' type='button'>Delete Preset</button>
                 </div>
+                <div class='cloudflare-row'>
+                    <a class='cloudflare-link' href='/switch/cloudflare'>Switch to Cloudflare</a>
+                </div>
             `;
-            document.body.insertBefore(wrapper, document.body.firstChild);
+            document.body.appendChild(wrapper);
 
             const themeSelect = document.getElementById('globalThemeSelect');
             const layoutSelect = document.getElementById('globalLayoutSelect');
@@ -1925,6 +2020,30 @@ COMMON_STYLE = """
 
 # --- 4. ROUTES ---
 # Authentication and account lifecycle routes
+@app.get("/switch/cloudflare")
+def switch_to_cloudflare(request: Request):
+    """Redirect users to a configured Cloudflare URL when available."""
+    target = CLOUDFLARE_SWITCH_URL
+    if target:
+        parsed = urlparse(target)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return RedirectResponse(target, status_code=307)
+    host = (request.url.hostname or "").lower()
+    if host.endswith("trycloudflare.com"):
+        return RedirectResponse("/", status_code=307)
+    return HTMLResponse(
+        f"""
+        <html><head>{COMMON_STYLE}</head><body>
+            <div class='card' style='max-width:640px;margin:48px auto;'>
+                <h2>Cloudflare link not configured</h2>
+                <p class='helper'>Set <strong>FP_CLOUDFLARE_URL</strong> to your public tunnel URL, then reload this page.</p>
+                <p><a class='btn btn-primary' href='https://www.cloudflare.com/products/tunnel/' target='_blank' rel='noopener'>Open Cloudflare Tunnel Docs</a></p>
+                <p><a href='/'>Return home</a></p>
+            </div>
+        </body></html>
+        """
+    )
+
 @app.get("/auth/register", response_class=HTMLResponse)
 def register_page(request: Request):
     """Render the web registration page with CSRF protection."""
@@ -2821,29 +2940,80 @@ def latest_news_route(force: int = 0):
         "items": items,
     }
 
+@app.get("/marketplace/autotempest")
+def marketplace_autotempest_listings_route(
+    make: str = "toyota",
+    model: str = "camry",
+    zip_code: str = "30301",
+    radius: Optional[str] = "50",
+    max_price: Optional[str] = None,
+):
+    """Return AutoTempest listing data for client-side progressive marketplace rendering."""
+    try:
+        clean_radius = 50
+        if radius is not None and str(radius).strip():
+            try:
+                clean_radius = int(str(radius).strip())
+            except ValueError:
+                clean_radius = 50
+
+        clean_max_price = None
+        if max_price is not None and str(max_price).strip():
+            try:
+                clean_max_price = int(str(max_price).strip())
+            except ValueError:
+                clean_max_price = None
+
+        items = extract_autotempest_listings(make, model, zip_code, clean_radius, clean_max_price)
+        return {"ok": True, "items": items}
+    except Exception:
+        return {
+            "ok": False,
+            "items": [],
+            "error": "Could not load AutoTempest listings right now. Please try again.",
+        }
+
 @app.get("/marketplace", response_class=HTMLResponse)
 def marketplace_page(
     request: Request,
     make: str = "toyota",
     model: str = "camry",
     zip_code: str = "30301",
-    radius: int = 50,
-    max_price: Optional[int] = None,
+    radius: Optional[str] = "50",
+    max_price: Optional[str] = None,
     mp_status: Optional[str] = None,
 ):
     """Render a Facebook-style marketplace view with local and AutoTempest listings."""
     csrf_token = get_or_create_csrf_token(request)
     user = get_current_user(request)
-    error_message = ""
-    web_listings = []
+
+    clean_radius = 50
+    if radius is not None and str(radius).strip():
+        try:
+            clean_radius = int(str(radius).strip())
+        except ValueError:
+            clean_radius = 50
+
+    clean_max_price = None
+    if max_price is not None and str(max_price).strip():
+        try:
+            clean_max_price = int(str(max_price).strip())
+        except ValueError:
+            clean_max_price = None
+
+    autotempest_query_json = json.dumps(
+        {
+            "make": (make or "toyota"),
+            "model": (model or "camry"),
+            "zip_code": (zip_code or "30301"),
+            "radius": clean_radius,
+            "max_price": clean_max_price,
+        }
+    )
     item_type_options_html = "".join(
         [f"<option value='{h(key)}'>{h(value['label'])}</option>" for key, value in MARKETPLACE_ITEM_TYPES.items()]
     )
     item_type_config_json = json.dumps(MARKETPLACE_ITEM_TYPES)
-    try:
-        web_listings = extract_autotempest_listings(make, model, zip_code, radius, max_price)
-    except Exception:
-        error_message = "Could not load AutoTempest listings right now. Please try again."
 
     community_rows = get_recent_marketplace_listings(limit=48, sold_only=False)
     sold_rows = get_recent_marketplace_listings(limit=48, sold_only=True)
@@ -2874,7 +3044,7 @@ def marketplace_page(
         <div class='video-card'>
             {image_html}
             <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,}</div>
-            <div class='video-title'>{h(row['title'])}</div>
+            <div class='video-title mp-title'>{h(row['title'])}</div>
             <div class='helper'><strong>{h(type_label)}</strong>{(' · ' + h(details_line)) if details_line else ''}</div>
             <div class='helper'>{h(meta_line)}</div>
             <div class='helper' style='min-height:2.3em;'>{h(description)}</div>
@@ -2903,7 +3073,7 @@ def marketplace_page(
         <div class='video-card'>
             {image_html}
             <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,} <span class='helper' style='font-weight:600;'>(SOLD)</span></div>
-            <div class='video-title'>{h(row['title'])}</div>
+            <div class='video-title mp-title'>{h(row['title'])}</div>
             <div class='helper'><strong>{h(type_label)}</strong>{(' · ' + h(details_line)) if details_line else ''}</div>
             <div class='helper'>{h(meta_line)}</div>
             <div class='video-actions'>
@@ -2912,32 +3082,10 @@ def marketplace_page(
         </div>
         """
 
-    web_cards_html = ""
-    for row in web_listings:
-        image_html = ""
-        if row.get("image"):
-            image_html = f"<a href='{h(row['link'])}' target='_blank' rel='noopener'><img class='video-thumb' src='{h(row['image'])}' alt='Listing image for {h(row['title'])}'></a>"
-        meta_bits = [bit for bit in [row.get("price"), row.get("miles"), row.get("location")] if bit]
-        meta_line = " · ".join(meta_bits)
-        web_cards_html += f"""
-        <div class='video-card'>
-            {image_html}
-            <div style='font-size:1.1em;font-weight:700;'>{h(row['price'])}</div>
-            <div class='video-title'>{h(row['title'])}</div>
-            <div class='helper'>{h(meta_line)}</div>
-            <div class='video-actions'>
-                <span class='helper'>{h(row['source'])}</span>
-                <a href='{h(row['link'])}' target='_blank' rel='noopener' class='btn btn-primary'>Open Listing ↗</a>
-            </div>
-        </div>
-        """
-
     if not community_cards_html:
         community_cards_html = "<div class='card'><p>No local listings yet. Be the first to post one.</p></div>"
     if not sold_cards_html:
         sold_cards_html = "<div class='card'><p>No sold listings yet.</p></div>"
-    if not web_cards_html and not error_message:
-        web_cards_html = "<div class='card'><p>No AutoTempest listings were found for this search.</p></div>"
 
     notice_lines = []
     if mp_status == "created":
@@ -2946,8 +3094,6 @@ def marketplace_page(
         notice_lines.append("<div class='card notice-ok'>Listing marked as sold.</div>")
     elif mp_status == "error":
         notice_lines.append("<div class='card notice-bad'>Could not create listing. Check your input and try again.</div>")
-    if error_message:
-        notice_lines.append(f"<div class='card notice-bad'>{h(error_message)}</div>")
     notice_html = "".join(notice_lines)
 
     create_listing_html = ""
@@ -2980,47 +3126,125 @@ def marketplace_page(
     <html><head>{COMMON_STYLE}</head><body>
     <a href='/'>← Back</a>
     <h1>🛒 Marketplace</h1>
-    <div class='card'>
+    <div class='card marketplace-hero'>
         <h2>Browse Marketplace</h2>
         <form action='/marketplace' method='get' style='display:flex;gap:8px;flex-wrap:wrap;'>
             <input type='text' name='make' value='{h(make)}' placeholder='Make (e.g., toyota)' required>
             <input type='text' name='model' value='{h(model)}' placeholder='Model (e.g., camry)' required>
             <input type='text' name='zip_code' value='{h(zip_code)}' placeholder='ZIP code' required>
-            <input type='number' name='radius' value='{h(radius)}' min='10' max='500' step='5' placeholder='Radius'>
-            <input type='number' name='max_price' value='{h(max_price or "")}' min='500' step='500' placeholder='Max price'>
+            <input type='number' name='radius' value='{h(str(clean_radius))}' min='10' max='500' step='5' placeholder='Radius'>
+            <input type='number' name='max_price' value='{h(str(clean_max_price) if clean_max_price is not None else "")}' min='500' step='500' placeholder='Max price'>
             <button type='submit' class='btn btn-primary'>Search Auto Listings</button>
         </form>
         <div class='helper' style='margin-top:8px;'>Facebook-style feed: local community listings + live AutoTempest listings.</div>
     </div>
     {create_listing_html}
     {notice_html}
-    <div class='card'>
+    <div class='card marketplace-section-card'>
         <h2>Local Community Listings</h2>
         <div class='video-grid'>
             {community_cards_html}
         </div>
     </div>
-    <div class='card'>
+    <div class='card marketplace-section-card'>
         <h2>Sold Listings</h2>
         <div class='helper'>Listings sellers mark as sold stay visible here.</div>
         <div class='video-grid'>
             {sold_cards_html}
         </div>
     </div>
-    <div class='card'>
+    <div class='card marketplace-section-card'>
         <h2>AutoTempest Listings</h2>
-        <div class='helper'>External listings scraped from AutoTempest based on your search filters.</div>
+        <div id='autotempestStatus' class='helper'>Loading listings from AutoTempest...</div>
     </div>
-    <div class='video-grid'>
-        {web_cards_html}
-    </div>
+    <div id='autotempestGrid' class='video-grid'></div>
     <script>
     (function() {{
         const itemTypeSelect = document.getElementById('mpItemType');
         const detailA = document.getElementById('mpDetailA');
         const detailB = document.getElementById('mpDetailB');
         const detailC = document.getElementById('mpDetailC');
+        const autotempestGrid = document.getElementById('autotempestGrid');
+        const autotempestStatus = document.getElementById('autotempestStatus');
+        const autotempestQuery = {autotempest_query_json};
         const config = {item_type_config_json};
+
+        function escapeHtml(value) {{
+            return String(value || '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }}
+
+        function renderLoadingCards(count) {{
+            if (!autotempestGrid) return;
+            autotempestGrid.innerHTML = Array.from({{ length: count }}).map((_, idx) =>
+                "<div class='video-card at-loading-card' data-idx='" + idx + "'><div class='video-thumb'></div><div class='at-skel-line w40'></div><div class='at-skel-line w80'></div><div class='at-skel-line w60'></div><div class='at-skel-line w80'></div></div>"
+            ).join('');
+        }}
+
+        function listingCardHtml(item) {{
+            const title = escapeHtml(item && item.title ? item.title : 'Listing');
+            const link = item && item.link ? item.link : '#';
+            const image = item && item.image ? "<a href='" + link + "' target='_blank' rel='noopener'><img class='video-thumb' src='" + escapeHtml(item.image) + "' alt='Listing image for " + title + "'></a>" : "";
+            const price = escapeHtml(item && item.price ? item.price : 'Price not shown');
+            const meta = [item && item.miles ? item.miles : '', item && item.location ? item.location : ''].filter(Boolean).map(escapeHtml).join(' · ');
+            const source = escapeHtml(item && item.source ? item.source : 'source');
+            return "<div class='video-card'>" +
+                image +
+                "<div style='font-size:1.1em;font-weight:700;'>" + price + "</div>" +
+                "<div class='video-title mp-title'>" + title + "</div>" +
+                "<div class='helper'>" + meta + "</div>" +
+                "<div class='video-actions'><span class='helper'>" + source + "</span><a href='" + link + "' target='_blank' rel='noopener' class='btn btn-primary'>Open Listing ↗</a></div>" +
+                "</div>";
+        }}
+
+        async function loadAutoTempestListings() {{
+            if (!autotempestGrid) return;
+            renderLoadingCards(10);
+            try {{
+                const query = new URLSearchParams();
+                query.set('make', autotempestQuery.make || 'toyota');
+                query.set('model', autotempestQuery.model || 'camry');
+                query.set('zip_code', autotempestQuery.zip_code || '30301');
+                query.set('radius', String(autotempestQuery.radius || 50));
+                if (autotempestQuery.max_price) query.set('max_price', String(autotempestQuery.max_price));
+                const resp = await fetch('/marketplace/autotempest?' + query.toString());
+                const data = await resp.json();
+                if (!resp.ok || !data.ok) {{
+                    if (autotempestStatus) autotempestStatus.textContent = data.error || 'Could not load AutoTempest listings right now.';
+                    autotempestGrid.innerHTML = "<div class='card'><p>Unable to load AutoTempest listings right now.</p></div>";
+                    return;
+                }}
+                const items = Array.isArray(data.items) ? data.items : [];
+                if (autotempestStatus) autotempestStatus.textContent = items.length ? ('Showing ' + items.length + ' AutoTempest listing' + (items.length === 1 ? '' : 's')) : 'No AutoTempest listings were found for this search.';
+                if (!items.length) {{
+                    autotempestGrid.innerHTML = "<div class='card'><p>No AutoTempest listings were found for this search.</p></div>";
+                    return;
+                }}
+                const loaders = Array.from(autotempestGrid.querySelectorAll('.at-loading-card'));
+                items.forEach((item, idx) => {{
+                    setTimeout(() => {{
+                        if (idx < loaders.length && loaders[idx]) {{
+                            loaders[idx].outerHTML = listingCardHtml(item);
+                        }} else {{
+                            autotempestGrid.insertAdjacentHTML('beforeend', listingCardHtml(item));
+                        }}
+                    }}, idx * 90);
+                }});
+                if (items.length < loaders.length) {{
+                    setTimeout(() => {{
+                        Array.from(autotempestGrid.querySelectorAll('.at-loading-card')).forEach((node) => node.remove());
+                    }}, items.length * 90 + 60);
+                }}
+            }} catch (_) {{
+                if (autotempestStatus) autotempestStatus.textContent = 'Could not load AutoTempest listings right now.';
+                autotempestGrid.innerHTML = "<div class='card'><p>Unable to load AutoTempest listings right now.</p></div>";
+            }}
+        }}
+
         function updateDetailPlaceholders() {{
             if (!itemTypeSelect || !detailA || !detailB || !detailC) return;
             const key = itemTypeSelect.value || 'other';
@@ -3033,6 +3257,7 @@ def marketplace_page(
             itemTypeSelect.addEventListener('change', updateDetailPlaceholders);
             updateDetailPlaceholders();
         }}
+        loadAutoTempestListings();
     }})();
     </script>
     </body></html>
@@ -3096,6 +3321,27 @@ def marketplace_mark_sold_route(
     except Exception:
         return RedirectResponse("/marketplace?mp_status=error", status_code=303)
     return RedirectResponse("/marketplace?mp_status=sold", status_code=303)
+
+@app.get("/marketplace/listings/{listing_id}/message")
+def marketplace_message_listing_route(listing_id: int, request: Request):
+    """Require sign-in before messaging seller about a listing."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    conn = get_db_connection()
+    row = conn.execute(
+        """
+        SELECT users.username AS seller_username
+        FROM marketplace_listings
+        JOIN users ON users.id = marketplace_listings.seller_user_id
+        WHERE marketplace_listings.id = ? AND marketplace_listings.is_active = 1
+        """,
+        (listing_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return RedirectResponse("/marketplace?mp_status=error", status_code=303)
+    return RedirectResponse(f"/messages?recipient_username={u(row['seller_username'])}", status_code=303)
 
 @app.post("/home/panels")
 def save_home_panel_preferences_route(
@@ -3375,6 +3621,38 @@ def web_home(
     else:
         recommendations_html = "<div class='card dashboard-panel' id='recommendations'><h2>✨ From People You Follow</h2><p>Sign in and follow users to get personalized recommendations.</p></div>"
 
+    marketplace_preview_rows = get_recent_marketplace_listings(limit=4, sold_only=False)
+    marketplace_local_preview_html = ""
+    for row in marketplace_preview_rows:
+        location = (row["location"] or "").strip()
+        location_html = f" · {h(location)}" if location else ""
+        marketplace_local_preview_html += f"""
+        <div class='note-item'>
+            <div>
+                <div class='market-mini-title'>{h(row['title'])}</div>
+                <div class='market-mini-meta'>${int(row['price']):,}{location_html}</div>
+            </div>
+            <a href='/marketplace' class='btn btn-secondary'>View</a>
+        </div>
+        """
+    if not marketplace_local_preview_html:
+        marketplace_local_preview_html = "<p class='helper'>No local marketplace listings yet.</p>"
+
+    marketplace_home_html = f"""
+    <div class='card dashboard-panel section-card' id='marketplace-mini'>
+        <h2>🛒 Marketplace Preview</h2>
+        <div class='market-mini-list'>
+            {marketplace_local_preview_html}
+        </div>
+        <div class='market-mini-list' style='margin-top:10px;'>
+            <h3 class='section-title' style='margin:0 0 6px;'>AutoTempest Picks</h3>
+            <div id='homeMarketplaceStatus' class='helper'>Loading AutoTempest listings...</div>
+            <div id='homeMarketplaceAutoList'></div>
+        </div>
+        <div style='margin-top:10px;'><a href='/marketplace' class='btn btn-primary'>Open Full Marketplace</a></div>
+    </div>
+    """
+
     # Build latest-news card content (cached server-side; refreshed client-side).
     news_items = fetch_latest_news()
     news_rows = render_news_rows_html(news_items)
@@ -3577,9 +3855,10 @@ def web_home(
     """
     secondary_column_html = f"""
     <div class='stack home-col-secondary home-col-secondary-sticky'>
-        <div class='card section-card'><h3 class='section-title'>Updates & Community</h3><p class='helper'>Setup status, recommendations, news, games, chat, and social activity.</p></div>
+        <div class='card section-card'><h3 class='section-title'>Updates & Community</h3><p class='helper'>Setup status, recommendations, marketplace previews, news, games, chat, and social activity.</p></div>
         {setup_html}
         {recommendations_html}
+        {marketplace_home_html}
         {news_html}
         {games_html}
         {chat_html.replace("<div class='card'>", "<div class='card dashboard-panel' id='chat'>", 1)}
@@ -3597,6 +3876,8 @@ def web_home(
         const refreshNewsBtn = document.getElementById('refreshNewsBtn');
         const newsRows = document.getElementById('newsRows');
         const newsUpdatedLabel = document.getElementById('newsUpdatedLabel');
+        const homeMarketplaceStatus = document.getElementById('homeMarketplaceStatus');
+        const homeMarketplaceAutoList = document.getElementById('homeMarketplaceAutoList');
         const resetPanelsBtn = document.getElementById('resetPanelsBtn');
         const collapsedPanelsCount = document.getElementById('collapsedPanelsCount');
         const panelStorageKey = 'fp_hidden_home_panels';
@@ -3626,6 +3907,49 @@ def web_home(
                 return "<div class='note-item'><div><strong>" + source + "</strong><br><small>" + title + "</small></div></div>";
             }}).join('');
         }}
+
+        function renderHomeMarketplaceAutoItems(items) {
+            if (!homeMarketplaceAutoList) return;
+            const rows = (items || []).slice(0, 4).map(function(item) {
+                const title = escapeHtml((item && item.title) ? item.title : 'AutoTempest listing');
+                const price = escapeHtml((item && item.price) ? item.price : 'See source');
+                const source = escapeHtml((item && item.source) ? item.source : 'autotempest');
+                const location = escapeHtml((item && item.location) ? item.location : '');
+                const miles = escapeHtml((item && item.miles) ? item.miles : '');
+                const metaBits = [price, source, location, miles].filter(Boolean).join(' · ');
+                const link = (item && item.link) ? item.link : '/marketplace';
+                return "<div class='note-item'><div><div class='market-mini-title'>" + title + "</div><div class='market-mini-meta'>" + metaBits + "</div></div><a href='" + link + "' class='btn btn-secondary' target='_blank' rel='noopener'>Open</a></div>";
+            }).join('');
+            homeMarketplaceAutoList.innerHTML = rows || "<p class='helper'>No AutoTempest listings found for the current query.</p>";
+        }
+
+        async function loadHomeMarketplaceAutoItems() {
+            if (!homeMarketplaceAutoList) return;
+            try {
+                const query = new URLSearchParams();
+                query.set('make', 'toyota');
+                query.set('model', 'camry');
+                query.set('zip_code', '30301');
+                query.set('radius', '50');
+                const resp = await fetch('/marketplace/autotempest?' + query.toString());
+                const data = await resp.json();
+                if (!resp.ok || !data.ok) {
+                    if (homeMarketplaceStatus) homeMarketplaceStatus.textContent = data.error || 'Could not load AutoTempest previews right now.';
+                    renderHomeMarketplaceAutoItems([]);
+                    return;
+                }
+                const items = Array.isArray(data.items) ? data.items : [];
+                if (homeMarketplaceStatus) {
+                    homeMarketplaceStatus.textContent = items.length
+                        ? ('Loaded ' + items.length + ' AutoTempest listing' + (items.length === 1 ? '' : 's'))
+                        : 'No AutoTempest listings found for the current query.';
+                }
+                renderHomeMarketplaceAutoItems(items);
+            } catch (_) {
+                if (homeMarketplaceStatus) homeMarketplaceStatus.textContent = 'Could not load AutoTempest previews right now.';
+                renderHomeMarketplaceAutoItems([]);
+            }
+        }
 
         function formatRelativeAge(msSinceUpdate) {{
             const seconds = Math.floor(msSinceUpdate / 1000);
@@ -3839,6 +4163,7 @@ def web_home(
         // Keep the relative “updated X ago” text fresh between fetches.
         updateNewsLabel('Loaded');
         initDashboardPanels();
+        loadHomeMarketplaceAutoItems();
         setInterval(function() {{
             updateNewsLabel('Loaded');
         }}, 10000);
@@ -4702,4 +5027,53 @@ def hangman_game_page(request: Request):
         return response
 
 if __name__ == "__main__":
-    subprocess.run(["uvicorn", f"{Path(__file__).stem}:app", "--reload", "--port", "8080"])
+    port = 8080
+    if "--port" in sys.argv:
+        try:
+            idx = sys.argv.index("--port")
+            port = int(sys.argv[idx + 1])
+        except Exception:
+            print("Invalid --port value. Falling back to 8080.")
+            port = 8080
+
+    cloud_mode = "--cloud" in sys.argv
+
+    if cloud_mode:
+        cloudflared_path = shutil.which("cloudflared")
+        if not cloudflared_path:
+            print("cloudflared is required for --cloud mode.")
+            print("Install on macOS with: brew install cloudflared")
+            raise SystemExit(1)
+
+        server_cmd = [
+            "uvicorn",
+            f"{Path(__file__).stem}:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+
+        print(f"Starting app server on http://127.0.0.1:{port} ...")
+        server_proc = subprocess.Popen(server_cmd)
+        time.sleep(1.2)
+        if server_proc.poll() is not None:
+            raise SystemExit("App server failed to start in --cloud mode.")
+
+        print("Starting Cloudflare tunnel...")
+        print("Copy the https://*.trycloudflare.com URL from the output below.")
+        try:
+            subprocess.run(
+                [cloudflared_path, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
+                check=False,
+            )
+        finally:
+            if server_proc.poll() is None:
+                server_proc.terminate()
+                try:
+                    server_proc.wait(timeout=5)
+                except Exception:
+                    server_proc.kill()
+        raise SystemExit(0)
+
+    subprocess.run(["uvicorn", f"{Path(__file__).stem}:app", "--reload", "--port", str(port)])

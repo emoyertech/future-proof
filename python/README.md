@@ -98,6 +98,35 @@ Then open:
 
 The script starts Uvicorn with reload on port `8080`.
 
+## Run the App in the Cloud (Public URL)
+
+You can run the same script in cloud mode using a Cloudflare tunnel:
+
+```bash
+brew install cloudflared
+python3 notes0.py --cloud
+```
+
+The terminal will print a public `https://...trycloudflare.com` URL you can share.
+
+One-command helper script:
+
+```bash
+./run_cloud.sh
+```
+
+Custom port with helper script:
+
+```bash
+./run_cloud.sh 8081
+```
+
+Optional custom port:
+
+```bash
+python3 notes0.py --cloud --port 8081
+```
+
 ## What a User Can Do (Web UI)
 
 On the home page (`/`), users can:
